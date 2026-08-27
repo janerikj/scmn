@@ -1,0 +1,21 @@
+# Tillfälliga filer från Linux-textredigerare (Vim, Nano, Emacs)
+.*.swp
+.*.swo
+*~
+\#*\#
+.#*
+
+# Loggfiler och skriptutdata
+*.log
+*.out
+*.err
+
+# Hemligheter och lokala miljövariabler (Dina API-nycklar och lösenord)
+.env
+*.env
+config.local.sh
+secret_*
+
+# Systemfiler och monteringsskräp
+.directory
+.Trash-*/
