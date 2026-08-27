@@ -60,8 +60,7 @@ ping_bot | - | ping -i 2 1.1.1.1 | none | - | false
 # Start all configured services
 ./scmn
 
-# View statused -i 's/gammal_sträng/ny_sträng/g' filnamn.txt
-s
+# View status
 ./scmn status
 ```
 
