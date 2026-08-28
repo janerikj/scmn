@@ -1,4 +1,4 @@
-# scmn (v0.6.4)
+# scmn (v0.7.1)
 
 > A lightweight, zero-daemon Linux service manager built on top of GNU Screen.
 
@@ -10,13 +10,14 @@
 
 - **Zero-Daemon Architecture**: Consumes **0 MB RAM** at idle. Only executes when invoked directly or periodically via cron.
 - **Interactive Attach/Detach**: Seamlessly jump into any service's console using native GNU Screen (`Ctrl+A`, then `D` to detach).
+- **Service Enable & Disable**: Enable or disable services directly from the CLI (`scmn enable`, `scmn disable`) with optional immediate action (`--now`).
 - **Direct Input Injection**: Send commands/input directly to a running service's `stdin` without attaching (`scmn send`).
 - **Flexible Restart Policies**:
   - `always`: Continuously loops and restarts the process immediately upon exit.
   - `on-failure`: Restarts only on non-zero exit codes; cleanly exits on `exit 0`.
   - `false`: Runs once and relies on cron checks or manual restarts.
 - **Automated Log Management**: Automatically truncates log files exceeding **50 MB** down to 25 MB in-place without breaking active logging descriptors.
-- **Status Metrics & Health Detection**: Real-time overview of process state (`RUNNING` in green, `RESTARTING` in yellow for crash loops, `STOPPED` in red), PID, memory usage (RAM), uptime, restart policy, and logfile paths.
+- **Status Metrics & Health Detection**: Real-time overview of process state (`RUNNING` in green, `RESTARTING` in yellow for crash loops, `STOPPED` in red, `DISABLED` in gray), PID, memory usage (RAM), uptime, restart policy, and logfile paths.
 - **Central Event Logging**: Records meaningful state changes, restarts, stops, and truncations to `~/.config/scmn/scmn.log` while keeping routine cron checks silent.
 - **Cron Watchdog**: Built-in commands to install/uninstall a 15-minute cron watchdog to ensure long-term availability.
 
@@ -42,8 +43,7 @@ chmod +x scmn
 Create `~/.config/scmn/scmn.conf` (or `./scmn.conf` in your project folder):
 
 ```bash
-# Format:
-# shortname | directory | command | logfile | env | auto_restart
+# Format: shortname | directory | command | logfile | env | auto_restart
 
 # Web service running from /var/www with environment variables
 webserver | /var/www | python3 -m http.server $PORT | /var/log/web.log | PORT=8080 | always
@@ -72,6 +72,8 @@ ping_bot | - | ping -i 2 1.1.1.1 | none | - | false
 | :--- | :--- |
 | `scmn [start] [shortname]` | Starts missing services (or a single specified service) |
 | `scmn status` (or `ls`) | Displays table with service status, PID, RAM, Uptime, and config |
+| `scmn enable <shortname> [--now]` | Enables service in config (uncomments line); starts immediately with `--now` |
+| `scmn disable <shortname> [--now]` | Disables service in config (comments out line); stops immediately with `--now` |
 | `scmn attach <shortname>` (or `a`) | Attaches directly to the service console (`attach` shows detach instructions, `a` attaches immideately) |
 | `scmn send <shortname> "<text>"` | Sends input/command to the service `stdin` |
 | `scmn stop <shortname\|--all>` | Gracefully stops service (`SIGTERM`) with `SIGKILL` fallback |
@@ -89,7 +91,7 @@ ping_bot | - | ping -i 2 1.1.1.1 | none | - | false
 
 `scmn` searches for configuration files in the following order:
 1. Specified via `-c /path/to/file.conf` or `--config /path/to/file.conf`
-2. Specified via `SCRMGR_CONF` environment variable
+2. Specified via `SCMN_CONF` environment variable
 3. `./scmn.conf` (current working directory)
 4. `~/.config/scmn/scmn.conf` (recommended user location)
 5. `/etc/scmn/scmn.conf` (system-wide location)
