@@ -74,7 +74,7 @@ ping_bot | - | ping -i 2 1.1.1.1 | none | - | false
 | `scmn status` (or `ls`) | Displays table with service status, PID, RAM, Uptime, and config |
 | `scmn enable <shortname> [--now]` | Enables service in config (uncomments line); starts immediately with `--now` |
 | `scmn disable <shortname> [--now]` | Disables service in config (comments out line); stops immediately with `--now` |
-| `scmn attach <shortname>` (or `a`) | Attaches directly to the service console (`attach` shows detach instructions, `a` attaches immideately) |
+| `scmn attach <shortname>` (or `a`) | Attaches directly to the service console (`attach` shows detach instructions, `a` attaches immediately) |
 | `scmn send <shortname> "<text>"` | Sends input/command to the service `stdin` |
 | `scmn stop <shortname\|--all>` | Gracefully stops service (`SIGTERM`) with `SIGKILL` fallback |
 | `scmn restart <shortname\|--all>` | Restarts one or all services |
