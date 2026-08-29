@@ -110,8 +110,8 @@ shortname | directory | command | logfile | env | auto_restart
   - `always` (or `true`): Always restarts immediately upon exit.
   - `on-failure` (or `fail`): Restarts immediately only if exit code is non-zero.
   - `false` (or `no`): No immediate restart loop.
-
-Lines starting with `#` and empty lines are ignored.
+    
+Lines starting with `#` and matching the syntax above are treated as disabled services; other lines starting with `#`, as well as empty lines, are ignored.
 
 ---
 
