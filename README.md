@@ -1,4 +1,4 @@
-# scmn (v0.7.1)
+# scmn (v0.8.0)
 
 > A lightweight, zero-daemon Linux service manager built on top of GNU Screen.
 
@@ -9,6 +9,8 @@
 ## Key Features
 
 - **Zero-Daemon Architecture**: Consumes **0 MB RAM** at idle. Only executes when invoked directly or periodically via cron.
+- **Smart Config Sync (`reload`)**: Hot-reloads configuration—starts missing services, restarts changed services, and stops disabled/removed services without unnecessary restarts.
+- **Config Validation (`check`)**: Validates syntax, duplicate names, paths, executables, and restart policies before deployment.
 - **Interactive Attach/Detach**: Seamlessly jump into any service's console using native GNU Screen (`Ctrl+A`, then `D` to detach).
 - **Service Enable & Disable**: Enable or disable services directly from the CLI (`scmn enable`, `scmn disable`) with optional immediate action (`--now`).
 - **Direct Input Injection**: Send commands/input directly to a running service's `stdin` without attaching (`scmn send`).
@@ -16,7 +18,7 @@
   - `always`: Continuously loops and restarts the process immediately upon exit.
   - `on-failure`: Restarts only on non-zero exit codes; cleanly exits on `exit 0`.
   - `false`: Runs once and relies on cron checks or manual restarts.
-- **Automated Log Management**: Automatically truncates log files exceeding **50 MB** down to 25 MB in-place without breaking active logging descriptors.
+- **Automated Log Management & Clearing**: Automatically truncates log files exceeding **50 MB** down to 25 MB in-place, and supports clearing logs on demand (`scmn log clear`).
 - **Status Metrics & Health Detection**: Real-time overview of process state (`RUNNING` in green, `RESTARTING` in yellow for crash loops, `STOPPED` in red, `DISABLED` in gray), PID, memory usage (RAM), uptime, restart policy, and logfile paths.
 - **Central Event Logging**: Records meaningful state changes, restarts, stops, and truncations to `~/.config/scmn/scmn.log` while keeping routine cron checks silent.
 - **Cron Watchdog**: Built-in commands to install/uninstall a 15-minute cron watchdog to ensure long-term availability.
@@ -72,6 +74,8 @@ ping_bot | - | ping -i 2 1.1.1.1 | none | - | false
 | :--- | :--- |
 | `scmn [start] [shortname]` | Starts missing services (or a single specified service) |
 | `scmn status` (or `ls`) | Displays table with service status, PID, RAM, Uptime, and config |
+| `scmn reload` | Syncs running services with config (starts missing, restarts changed, stops disabled/removed) |
+| `scmn check` | Validates configuration file syntax, paths, binaries, and policies |
 | `scmn enable <shortname> [--now]` | Enables service in config (uncomments line); starts immediately with `--now` |
 | `scmn disable <shortname> [--now]` | Disables service in config (comments out line); stops immediately with `--now` |
 | `scmn attach <shortname>` (or `a`) | Attaches directly to the service console (`attach` shows detach instructions, `a` attaches immediately) |
@@ -79,6 +83,7 @@ ping_bot | - | ping -i 2 1.1.1.1 | none | - | false
 | `scmn stop <shortname\|--all>` | Gracefully stops service (`SIGTERM`) with `SIGKILL` fallback |
 | `scmn restart <shortname\|--all>` | Restarts one or all services |
 | `scmn log [shortname] [lines]` | Tails service log (or scmn manager log if shortname omitted) |
+| `scmn log clear [name\|--all]` | Clears service log, all logs (`--all`), or scmn manager log |
 | `scmn cron install` | Installs 15-minute watchdog cron job into crontab |
 | `scmn cron uninstall` | Removes watchdog cron job from crontab |
 | `scmn cron status` | Checks if the watchdog cron job is active |

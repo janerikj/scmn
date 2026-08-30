@@ -9,7 +9,7 @@
 set -euo pipefail
 
 # Application version
-VERSION="v0.7.1"
+VERSION="v0.8.0"
 
 # Ensure SCREENDIR is set and safe (prevents permission issues on some Linux setups)
 if [[ -z "${SCREENDIR:-}" ]]; then
@@ -19,6 +19,16 @@ if [[ ! -d "$SCREENDIR" ]]; then
     mkdir -p "$SCREENDIR"
     chmod 700 "$SCREENDIR"
 fi
+
+# State directory for tracking service configuration signatures (used by reload)
+get_state_dir() {
+    local statedir="${SCMN_STATE_DIR:-$HOME/.config/scmn/.state}"
+    if ! mkdir -p "$statedir" 2>/dev/null; then
+        statedir="/tmp/scmn_state_${UID:-0}"
+        mkdir -p "$statedir" 2>/dev/null || true
+    fi
+    echo "$statedir"
+}
 
 # Configuration locations (checked in order)
 DEFAULT_CONFIG_LOCATIONS=(
@@ -231,12 +241,21 @@ start_service() {
     initial_state=$(get_service_state "$name" "$cmd")
 
     if [[ "$initial_state" == "RUNNING" ]]; then
+        local statedir
+        statedir=$(get_state_dir)
+        echo "${dir}|${cmd}|${logfile}|${env_vars}|${auto_restart}" > "$statedir/$name.state" 2>/dev/null || true
         log_success "Started service '$name' (Command: $cmd)"
         log_event "OK" "Started service '$name' (Command: $cmd)"
     elif [[ "$initial_state" == "RESTARTING" ]]; then
+        local statedir
+        statedir=$(get_state_dir)
+        echo "${dir}|${cmd}|${logfile}|${env_vars}|${auto_restart}" > "$statedir/$name.state" 2>/dev/null || true
         log_warn "Started session for '$name', but command failed/is restarting (Command: $cmd)"
         log_event "WARN" "Started session for '$name', but command failed/is restarting (Command: $cmd)"
     elif is_running "$name"; then
+        local statedir
+        statedir=$(get_state_dir)
+        echo "${dir}|${cmd}|${logfile}|${env_vars}|${auto_restart}" > "$statedir/$name.state" 2>/dev/null || true
         log_success "Started service '$name' (Command: $cmd)"
         log_event "OK" "Started service '$name' (Command: $cmd)"
     else
@@ -614,6 +633,9 @@ stop_service_by_name() {
     fi
 
     if ! is_running "$name"; then
+        local statedir
+        statedir=$(get_state_dir)
+        rm -f "$statedir/$name.state" 2>/dev/null || true
         log_success "Stopped service '$name'."
         log_event "OK" "Stopped service '$name'."
     else
@@ -913,8 +935,377 @@ cmd_restart() {
     fi
 }
 
+# Command: Synchronize running services with configuration file
+cmd_reload() {
+    ensure_config
+    log_info "Using configuration: ${CONFIG_FILE}"
+    log_info "Synchronizing services with configuration..."
+    echo
+
+    local -A configured_enabled=()
+    local -A configured_disabled=()
+    local -A service_dir=()
+    local -A service_cmd=()
+    local -A service_log=()
+    local -A service_env=()
+    local -A service_restart=()
+
+    collect_services_callback() {
+        local name="$1"
+        local dir="$2"
+        local cmd="$3"
+        local logfile="$4"
+        local env_vars="$5"
+        local auto_restart="$6"
+        local is_disabled="${7:-false}"
+
+        service_dir["$name"]="$dir"
+        service_cmd["$name"]="$cmd"
+        service_log["$name"]="$logfile"
+        service_env["$name"]="$env_vars"
+        service_restart["$name"]="$auto_restart"
+
+        if [[ "$is_disabled" == "true" ]]; then
+            configured_disabled["$name"]=1
+        else
+            configured_enabled["$name"]=1
+        fi
+    }
+
+    parse_config collect_services_callback "true"
+
+    local statedir
+    statedir=$(get_state_dir)
+
+    local stopped_count=0
+    local restarted_count=0
+    local started_count=0
+    local unchanged_count=0
+
+    # Step 1: Check running services
+    for name in "${!service_cmd[@]}"; do
+        if is_running "$name"; then
+            if [[ -n "${configured_disabled[$name]:-}" ]]; then
+                log_info "Stopping disabled service '$name'..."
+                stop_service_by_name "$name"
+                stopped_count=$((stopped_count + 1))
+            elif [[ -n "${configured_enabled[$name]:-}" ]]; then
+                local current_sig="${service_dir[$name]}|${service_cmd[$name]}|${service_log[$name]}|${service_env[$name]}|${service_restart[$name]}"
+                local state_file="$statedir/$name.state"
+                local old_sig=""
+                if [[ -f "$state_file" ]]; then
+                    old_sig=$(cat "$state_file" 2>/dev/null || true)
+                fi
+
+                if [[ -n "$old_sig" && "$old_sig" == "$current_sig" ]]; then
+                    log_info "Service '$name' is up-to-date and running."
+                    unchanged_count=$((unchanged_count + 1))
+                else
+                    log_info "Configuration changed for '$name'. Restarting..."
+                    stop_service_by_name "$name"
+                    sleep 0.3
+                    start_service "$name" "${service_dir[$name]}" "${service_cmd[$name]}" "${service_log[$name]}" "${service_env[$name]}" "${service_restart[$name]}"
+                    restarted_count=$((restarted_count + 1))
+                fi
+            fi
+        fi
+    done
+
+    # Step 2: Start enabled services that are not running
+    for name in "${!configured_enabled[@]}"; do
+        if ! is_running "$name"; then
+            log_info "Starting missing service '$name'..."
+            start_service "$name" "${service_dir[$name]}" "${service_cmd[$name]}" "${service_log[$name]}" "${service_env[$name]}" "${service_restart[$name]}"
+            started_count=$((started_count + 1))
+        fi
+    done
+
+    echo
+    log_info "Checking log file sizes (Limit: ${MAX_LOG_SIZE_MB}MB)..."
+    check_logs_callback() {
+        local name="$1"
+        local dir="$2"
+        local cmd="$3"
+        local logfile="$4"
+
+        truncate_log_if_needed "$name" "$logfile"
+    }
+    parse_config check_logs_callback
+
+    echo
+    log_success "Reload completed (Started: $started_count, Restarted: $restarted_count, Stopped: $stopped_count, Unchanged: $unchanged_count)."
+    log_event "OK" "Reloaded configuration from ${CONFIG_FILE} (Started: $started_count, Restarted: $restarted_count, Stopped: $stopped_count, Unchanged: $unchanged_count)."
+}
+
+# Command: Validate configuration file syntax and definitions
+cmd_check() {
+    ensure_config
+    log_info "Checking configuration file: ${CONFIG_FILE}"
+    echo
+
+    local errors=()
+    local warnings=()
+    local enabled_count=0
+    local disabled_count=0
+    local -A seen_names=()
+    local -A seen_lines=()
+
+    local line_num=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line_num=$((line_num + 1))
+
+        local trimmed
+        trimmed="$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+
+        if [[ -z "$trimmed" ]]; then
+            continue
+        fi
+
+        local is_comment=false
+        if [[ "$trimmed" =~ ^# ]]; then
+            is_comment=true
+        fi
+
+        local parse_line="$trimmed"
+        local is_disabled=false
+        if $is_comment; then
+            parse_line="$(echo "$trimmed" | sed -e 's/^#[[:space:]]*//')"
+            is_disabled=true
+        fi
+
+        # Skip comments without pipe delimiter
+        if [[ "$parse_line" != *"|"* ]]; then
+            continue
+        fi
+
+        local name="" dir="" cmd="" logfile="" env_vars="" auto_restart=""
+        IFS='|' read -r name dir cmd logfile env_vars auto_restart <<< "$parse_line"
+
+        name=$(echo "${name:-}" | xargs)
+        dir=$(echo "${dir:-}" | xargs)
+        cmd=$(echo "${cmd:-}" | xargs)
+        logfile=$(echo "${logfile:-}" | xargs)
+        env_vars=$(echo "${env_vars:-}" | xargs)
+        auto_restart=$(echo "${auto_restart:-}" | xargs)
+
+        # Ignore known header comments
+        if [[ "$name" =~ ^(shortname|Format|Format:|Rules:|Rules)$ ]]; then
+            continue
+        fi
+
+        if $is_comment && [[ ! "$name" =~ ^[a-zA-Z0-9_.-]+$ ]]; then
+            continue
+        fi
+
+        # Shortname syntax check
+        if [[ -z "$name" ]]; then
+            errors+=("Line $line_num: Missing service shortname.")
+            continue
+        fi
+
+        if [[ ! "$name" =~ ^[a-zA-Z0-9_.-]+$ ]]; then
+            errors+=("Line $line_num: Invalid shortname '$name'. Must contain only letters, numbers, underscores, dots, or hyphens.")
+        fi
+
+        # Duplicate shortname check
+        if [[ -n "${seen_names[$name]:-}" ]]; then
+            errors+=("Line $line_num: Duplicate service shortname '$name' (previously defined on line ${seen_lines[$name]}).")
+        else
+            seen_names["$name"]=1
+            seen_lines["$name"]=$line_num
+        fi
+
+        if $is_disabled; then
+            disabled_count=$((disabled_count + 1))
+        else
+            enabled_count=$((enabled_count + 1))
+        fi
+
+        # Command check
+        if [[ -z "$cmd" ]]; then
+            errors+=("Line $line_num: Service '$name' is missing a command.")
+        else
+            local primary_bin
+            primary_bin=$(echo "$cmd" | awk '{print $1}')
+            if [[ -n "$primary_bin" ]]; then
+                if [[ "$primary_bin" == ./* || "$primary_bin" == /* ]]; then
+                    if [[ ! -e "$primary_bin" ]]; then
+                        warnings+=("Line $line_num: Executable '$primary_bin' for service '$name' not found on disk.")
+                    fi
+                elif ! command -v "$primary_bin" >/dev/null 2>&1; then
+                    if ! type "$primary_bin" >/dev/null 2>&1; then
+                        warnings+=("Line $line_num: Command '$primary_bin' for service '$name' not found in PATH.")
+                    fi
+                fi
+            fi
+        fi
+
+        # Directory check
+        if [[ -n "$dir" && "$dir" != "-" ]]; then
+            if [[ ! -d "$dir" ]]; then
+                warnings+=("Line $line_num: Working directory '$dir' for service '$name' does not exist.")
+            fi
+        fi
+
+        # Logfile check
+        if [[ -n "$logfile" && "$logfile" != "none" && "$logfile" != "off" && "$logfile" != "-" ]]; then
+            local logdir
+            logdir=$(dirname "$logfile")
+            if [[ ! -d "$logdir" ]]; then
+                if ! mkdir -p "$logdir" 2>/dev/null; then
+                    warnings+=("Line $line_num: Log directory '$logdir' for service '$name' does not exist and cannot be created.")
+                fi
+            fi
+        fi
+
+        # Auto-restart policy check
+        if [[ -n "$auto_restart" && "$auto_restart" != "-" ]]; then
+            case "$(echo "$auto_restart" | tr '[:upper:]' '[:lower:]')" in
+                always|true|1|yes|on-failure|on_failure|failure|fail|false|no|never|0)
+                    ;;
+                *)
+                    warnings+=("Line $line_num: Unknown auto_restart policy '$auto_restart' for service '$name' (defaults to 'never').")
+                    ;;
+            esac
+        fi
+
+    done < "$CONFIG_FILE"
+
+    # Display results
+    if (( ${#errors[@]} > 0 )); then
+        for err in "${errors[@]}"; do
+            log_error "$err"
+        done
+    fi
+
+    if (( ${#warnings[@]} > 0 )); then
+        for warn in "${warnings[@]}"; do
+            log_warn "$warn"
+        done
+    fi
+
+    echo
+    if (( ${#errors[@]} > 0 )); then
+        log_error "Configuration check FAILED with ${#errors[@]} error(s) and ${#warnings[@]} warning(s)."
+        return 1
+    elif (( ${#warnings[@]} > 0 )); then
+        log_warn "Configuration check PASSED with ${#warnings[@]} warning(s) ($enabled_count enabled, $disabled_count disabled service(s))."
+        return 0
+    else
+        log_success "Configuration syntax is valid ($enabled_count enabled, $disabled_count disabled service(s))."
+        return 0
+    fi
+}
+
+# Command: Clear log file for a service, all services (--all), or scmn manager log (default)
+cmd_log_clear() {
+    local target="${1:-}"
+
+    # Case 1: No target specified -> clear manager central log
+    if [[ -z "$target" ]]; then
+        local manager_log="${SCMN_LOG:-$HOME/.config/scmn/scmn.log}"
+        if [[ ! -f "$manager_log" ]]; then
+            log_info "Manager log file '$manager_log' does not exist yet (nothing to clear)."
+            return 0
+        fi
+
+        : > "$manager_log" 2>/dev/null || true
+        log_success "Cleared scmn manager log ($manager_log)."
+        log_event "OK" "Cleared scmn manager log ($manager_log)."
+        return 0
+    fi
+
+    # Case 2: --all specified -> clear all service log files and manager log
+    if [[ "$target" == "--all" ]]; then
+        ensure_config
+        local cleared_count=0
+        local seen_logs=()
+
+        clear_all_logs_callback() {
+            local name="$1"
+            local dir="$2"
+            local cmd="$3"
+            local logfile="$4"
+
+            if [[ -n "$logfile" && "$logfile" != "none" && "$logfile" != "off" && "$logfile" != "-" ]]; then
+                for seen in "${seen_logs[@]:-}"; do
+                    if [[ "$seen" == "$logfile" ]]; then
+                        return 0
+                    fi
+                done
+                seen_logs+=("$logfile")
+
+                if [[ -f "$logfile" ]]; then
+                    : > "$logfile" 2>/dev/null || true
+                    log_success "Cleared log for '$name' ($logfile)."
+                    cleared_count=$((cleared_count + 1))
+                fi
+            fi
+        }
+
+        parse_config clear_all_logs_callback "true"
+
+        local manager_log="${SCMN_LOG:-$HOME/.config/scmn/scmn.log}"
+        if [[ -f "$manager_log" ]]; then
+            : > "$manager_log" 2>/dev/null || true
+            log_success "Cleared manager log ($manager_log)."
+            cleared_count=$((cleared_count + 1))
+        fi
+
+        log_success "Cleared all log files ($cleared_count file(s))."
+        log_event "OK" "Cleared all log files ($cleared_count file(s))."
+        return 0
+    fi
+
+    # Case 3: Specific service shortname
+    ensure_config
+    local target_logfile=""
+    local service_found=false
+
+    find_target_logfile_callback() {
+        local name="$1"
+        local dir="$2"
+        local cmd="$3"
+        local logfile="$4"
+
+        if [[ "$name" == "$target" ]]; then
+            service_found=true
+            target_logfile="$logfile"
+        fi
+    }
+
+    parse_config find_target_logfile_callback "true"
+
+    if ! $service_found; then
+        log_error "Service '$target' not found in configuration file '${CONFIG_FILE}'."
+        exit 1
+    fi
+
+    if [[ -z "$target_logfile" || "$target_logfile" == "none" || "$target_logfile" == "off" || "$target_logfile" == "-" ]]; then
+        log_warn "Service '$target' does not have a log file configured."
+        return 0
+    fi
+
+    if [[ ! -f "$target_logfile" ]]; then
+        log_info "Log file '$target_logfile' for service '$target' does not exist yet (nothing to clear)."
+        return 0
+    fi
+
+    : > "$target_logfile" 2>/dev/null || true
+    log_success "Cleared log file '$target_logfile' for service '$target'."
+    log_event "OK" "Cleared log file '$target_logfile' for service '$target'."
+}
+
 ## Command: View logs for a service or the manager log if shortname is omitted
 cmd_log() {
+    local first="${1:-}"
+
+    if [[ "$first" == "clear" || "$first" == "--clear" ]]; then
+        shift || true
+        cmd_log_clear "${1:-}"
+        return 0
+    fi
+
     local target="${1:-}"
     local lines="${2:-50}"
 
@@ -1037,6 +1428,8 @@ show_help() {
     echo -e "${BOLD}COMMANDS:${NC}"
     echo "  scmn [start] [shortname]       Starts missing services (or a specific service)"
     echo "  scmn status | ls               Lists all configured services with PID, RAM, Uptime"
+    echo "  scmn reload                    Syncs running services with config (starts, stops, restarts)"
+    echo "  scmn check                     Validates configuration file syntax and paths"
     echo "  scmn enable <shortname> [--now]  Enables service in config (uncomment) & optionally starts"
     echo "  scmn disable <shortname> [--now] Disables service in config (comment out) & optionally stops"
     echo "  scmn attach <shortname>        Attaches directly to selected service screen session"
@@ -1045,6 +1438,7 @@ show_help() {
     echo "  scmn stop <shortname|--all>    Stops one or all services (graceful + SIGKILL fallback)"
     echo "  scmn restart <shortname|--all> Restarts one or all services"
     echo "  scmn log [shortname] [lines]   Tails service log (or scmn log if shortname omitted)"
+    echo "  scmn log clear [name|--all]    Clears service log, all logs (--all), or scmn manager log"
     echo "  scmn cron install              Installs cron job (runs 'scmn' every 15 minutes)"
     echo "  scmn cron uninstall            Removes cron job from crontab"
     echo "  scmn cron status               Displays status of the cron job"
@@ -1110,6 +1504,12 @@ main() {
         status|ls|list)
             cmd_status
             ;;
+        reload)
+            cmd_reload
+            ;;
+        check|test|lint)
+            cmd_check
+            ;;
         enable)
             shift
             cmd_enable "$@"
@@ -1134,9 +1534,13 @@ main() {
             shift
             cmd_restart "${1:-}"
             ;;
+        log-clear|clear-log)
+            shift
+            cmd_log_clear "${1:-}"
+            ;;
         log|logs)
             shift
-            cmd_log "${1:-}" "${2:-50}"
+            cmd_log "$@"
             ;;
         cron)
             shift
