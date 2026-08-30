@@ -9,9 +9,9 @@
 ## Key Features
 
 - **Zero-Daemon Architecture**: Consumes **0 MB RAM** at idle. Only executes when invoked directly or periodically via cron.
+- **Interactive Attach/Detach**: Seamlessly jump into any service's console using native GNU Screen (`Ctrl+A`, then `D` to detach).
 - **Smart Config Sync (`reload`)**: Hot-reloads configuration—starts missing services, restarts changed services, and stops disabled/removed services without unnecessary restarts.
 - **Config Validation (`check`)**: Validates syntax, duplicate names, paths, executables, and restart policies before deployment.
-- **Interactive Attach/Detach**: Seamlessly jump into any service's console using native GNU Screen (`Ctrl+A`, then `D` to detach).
 - **Service Enable & Disable**: Enable or disable services directly from the CLI (`scmn enable`, `scmn disable`) with optional immediate action (`--now`).
 - **Direct Input Injection**: Send commands/input directly to a running service's `stdin` without attaching (`scmn send`).
 - **Flexible Restart Policies**:
