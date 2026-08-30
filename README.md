@@ -1,4 +1,4 @@
-# scmn (v0.8.0)
+# scmn (v0.8.1)
 
 > A lightweight, zero-daemon Linux service manager built on top of GNU Screen.
 
@@ -78,7 +78,7 @@ ping_bot | - | ping -i 2 1.1.1.1 | none | - | false
 | `scmn check` | Validates configuration file syntax, paths, binaries, and policies |
 | `scmn enable <shortname> [--now]` | Enables service in config (uncomments line); starts immediately with `--now` |
 | `scmn disable <shortname> [--now]` | Disables service in config (comments out line); stops immediately with `--now` |
-| `scmn attach <shortname>` (or `a`) | Attaches directly to the service console (`attach` shows detach instructions, `a` attaches immediately) |
+| `scmn attach <shortname>` (or `a`) | Attaches directly to the service console |
 | `scmn send <shortname> "<text>"` | Sends input/command to the service `stdin` |
 | `scmn stop <shortname\|--all>` | Gracefully stops service (`SIGTERM`) with `SIGKILL` fallback |
 | `scmn restart <shortname\|--all>` | Restarts one or all services |
@@ -115,7 +115,7 @@ shortname | directory | command | logfile | env | auto_restart
   - `always` (or `true`): Always restarts immediately upon exit.
   - `on-failure` (or `fail`): Restarts immediately only if exit code is non-zero.
   - `false` (or `no`): No immediate restart loop.
-    
+
 Lines starting with `#` and matching the syntax above are treated as disabled services; other lines starting with `#`, as well as empty lines, are ignored.
 
 ---
@@ -158,6 +158,9 @@ By default, log files are truncated when they exceed **50 MB** (keeping the last
 ```bash
 MAX_LOG_SIZE_MB=100 scmn
 ```
+
+### 5. Console Status Bar & Scrollback Buffer
+When attaching to a service (`scmn attach <shortname>`), `scmn` displays a status bar at the bottom of the screen with the service name, detach shortcut (`Ctrl+A D`), hostname, and time. Sessions automatically run in **UTF-8 mode (`-U`)** with **1000 lines of scrollback buffer in RAM** (customizable via `SCMN_SCROLLBACK=5000`).
 
 ---
 

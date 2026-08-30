@@ -9,7 +9,7 @@
 set -euo pipefail
 
 # Application version
-VERSION="v0.8.0"
+VERSION="v0.8.1"
 
 # Ensure SCREENDIR is set and safe (prevents permission issues on some Linux setups)
 if [[ -z "${SCREENDIR:-}" ]]; then
@@ -185,8 +185,9 @@ start_service() {
         fi
     fi
 
-    # Build screen command
-    local screen_args=(-dmS "$name")
+    # Build screen command (-U for UTF-8 mode, -h for scrollback buffer)
+    local scrollback="${SCMN_SCROLLBACK:-1000}"
+    local screen_args=(-U -h "$scrollback" -dmS "$name")
 
     # Logging options
     if [[ -n "$logfile" && "$logfile" != "none" && "$logfile" != "off" && "$logfile" != "-" ]]; then
@@ -235,6 +236,9 @@ start_service() {
     else
         screen "${screen_args[@]}" bash -c "$exec_cmd"
     fi
+
+    # Configure visual status/caption bar inside Screen when attached
+    screen -S "$name" -X caption always "%{= kc}[scmn: $name]%{= kw} | Detach: %{= ky}Ctrl+A D%{= kw} | Host: %H | %c" 2>/dev/null || true
 
     sleep 0.4
     local initial_state
@@ -832,11 +836,6 @@ cmd_attach() {
         exit 1
     fi
 
-    if [[ "${2:-}" == "attach" ]]; then
-        log_info "Attaching to screen session '$target' (Detach with Ctrl+A followed by D)..."
-        sleep 3
-    fi
-
     exec screen -r "$target"
 }
 
@@ -1432,8 +1431,7 @@ show_help() {
     echo "  scmn check                     Validates configuration file syntax and paths"
     echo "  scmn enable <shortname> [--now]  Enables service in config (uncomment) & optionally starts"
     echo "  scmn disable <shortname> [--now] Disables service in config (comment out) & optionally stops"
-    echo "  scmn attach <shortname>        Attaches directly to selected service screen session"
-    echo "  scmn a <shortname>             As above, but without detach instruction."
+    echo "  scmn attach | a <shortname>    Attaches directly to selected service screen session"
     echo "  scmn send <shortname> <txt>    Sends input/command directly to service stdin"
     echo "  scmn stop <shortname|--all>    Stops one or all services (graceful + SIGKILL fallback)"
     echo "  scmn restart <shortname|--all> Restarts one or all services"
