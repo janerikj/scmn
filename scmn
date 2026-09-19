@@ -9,7 +9,7 @@
 set -euo pipefail
 
 # Application version
-VERSION="v0.9.0"
+VERSION="v0.10.0"
 
 # Ensure SCREENDIR is set and safe (prevents permission issues on some Linux setups)
 if [[ -z "${SCREENDIR:-}" ]]; then
@@ -143,13 +143,33 @@ docker_service_name() {
     echo "scmn_$(echo "$1" | tr '[:upper:]' '[:lower:]')"
 }
 
-# Inject `--name scmn_<shortname>` into a docker run command that lacks it
-docker_inject_name() {
+# Docker tracking label used to find a service's containers regardless of --name
+docker_label_value() {
+    echo "scmn.service=$1"
+}
+
+# Inject scmn's tracking label (and a deterministic --name when none is given)
+# into a docker run command. Label-based tracking works even for containers
+# that end up with random names (e.g. leftover containers from scmn v0.8).
+docker_inject_start_flags() {
     local cmd="$1"
     local shortname="$2"
-    local inject
-    inject=$(docker_service_name "$shortname")
-    echo "$cmd" | sed -E "s/docker( container)? run/docker\1 run --name ${inject}/"
+    local inject=""
+    local inject_name inject_label
+    inject_name=$(docker_service_name "$shortname")
+    inject_label=$(docker_label_value "$shortname")
+
+    if ! docker_cmd_has_name "$cmd"; then
+        inject+=" --name ${inject_name}"
+    fi
+    if ! grep -q 'scmn\.service=' <<<"$cmd"; then
+        inject+=" --label ${inject_label}"
+    fi
+    if [[ -n "$inject" ]]; then
+        echo "$cmd" | sed -E "s/docker( container)?[[:space:]]+run/docker\1 run${inject}/"
+    else
+        echo "$cmd"
+    fi
 }
 
 # Extract all container names explicitly set via --name in the command
@@ -176,33 +196,77 @@ docker_cmd_names() {
     docker_service_name "$shortname"
 }
 
-# Container ID of a running container by exact name (empty if not running)
-docker_container_id() {
-    local name="$1"
-    docker ps --format '{{.Names}}\t{{.ID}}' 2>/dev/null | awk -F'\t' -v n="$name" '$1==n {print $2}' | head -n 1
+# Emit "name<TAB>id" lines for containers belonging to a service: matched by
+# the scmn.service label OR by any container name this service could use
+# (explicit --name in the command, or the deterministic scmn_<shortname>).
+# mode: "running" (default) or "all".
+docker_matched() {
+    local cmd="$1"
+    local shortname="$2"
+    local mode="${3:-running}"
+    local names
+    names=$(docker_cmd_names "$cmd" "$shortname")
+
+    local awk_prog='function in_names(n, list, i) {
+        c = split(list, a, " ")
+        for (i = 1; i <= c; i++) if (a[i] == n) return 1
+        return 0
+    }
+    $3 == owner || in_names($1, cache) { print $1 "\t" $2 }'
+
+    if [[ "$mode" == "all" ]]; then
+        docker ps -a --format '{{.Names}}\t{{.ID}}\t{{.Label "scmn.service"}}' 2>/dev/null |
+            awk -F'\t' -v owner="$shortname" -v cache="$names" "$awk_prog"
+    else
+        docker ps --format '{{.Names}}\t{{.ID}}\t{{.Label "scmn.service"}}' 2>/dev/null |
+            awk -F'\t' -v owner="$shortname" -v cache="$names" "$awk_prog"
+    fi
 }
 
-# True if a container exists (running or stopped) with this exact name
-docker_any_exists() {
-    local name="$1"
-    docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$name"
+# Container IDs (running, or all) belonging to a service
+docker_matched_ids() {
+    local cmd="$1"
+    local shortname="$2"
+    local mode="${3:-running}"
+    docker_matched "$cmd" "$shortname" "$mode" | cut -f2
 }
 
 # True if any candidate container for the service is currently running
 docker_any_container_running() {
     local cmd="$1"
     local shortname="$2"
-    local n
     if ! command -v docker >/dev/null 2>&1; then
         return 1
     fi
-    while IFS= read -r n; do
-        [[ -n "$n" ]] || continue
-        if [[ -n "$(docker_container_id "$n")" ]]; then
-            return 0
-        fi
-    done < <(docker_cmd_names "$cmd" "$shortname")
+    if [[ -n "$(docker_matched_ids "$cmd" "$shortname" running | head -n 1)" ]]; then
+        return 0
+    fi
     return 1
+}
+
+# Uptime (seconds) of a container since it started
+docker_container_uptime() {
+    local id="$1"
+    local started
+    started=$(docker inspect -f '{{.State.StartedAt}}' "$id" 2>/dev/null || true)
+    [[ -z "$started" ]] && { echo "-"; return 0; }
+    local start_epoch now
+    start_epoch=$(date -d "$started" +%s 2>/dev/null || true)
+    [[ -z "$start_epoch" ]] && { echo "-"; return 0; }
+    now=$(date +%s)
+    echo $((now - start_epoch))
+}
+
+# Resident memory of a container (docker stats MemUsage, first field)
+docker_container_ram() {
+    local id="$1"
+    local mem
+    mem=$(docker stats --no-stream --format '{{.MemUsage}}' "$id" 2>/dev/null || true)
+    if [[ -n "$mem" ]]; then
+        echo "$mem" | awk '{print $1}'
+    else
+        echo "-"
+    fi
 }
 
 # Stop (and remove) all containers belonging to a docker service
@@ -214,22 +278,21 @@ docker_stop_cmd() {
         return 0
     fi
 
-    local -A seen=()
-    local -a targets=()
-    local n
-    while IFS= read -r n; do
-        [[ -n "$n" ]] || continue
-        if [[ -z "${seen[$n]:-}" ]]; then
-            seen[$n]=1
-            targets+=("$n")
-        fi
-    done < <(docker_cmd_names "$cmd" "$shortname")
+    local -a ids=()
+    local id
+    while IFS= read -r id; do
+        [[ -n "$id" ]] && ids+=("$id")
+    done < <(docker_matched_ids "$cmd" "$shortname" all)
+
+    if [[ ${#ids[@]} -eq 0 ]]; then
+        return 0
+    fi
 
     local stopped_any=false
-    for n in "${targets[@]:-}"; do
-        if [[ -n "$(docker_container_id "$n")" ]]; then
-            docker stop "$n" >/dev/null 2>&1 || true
-            log_info "Stopping Docker container '$n' for service '$shortname'."
+    for id in "${ids[@]:-}"; do
+        if [[ -n "$id" ]] && docker ps --format '{{.ID}}' 2>/dev/null | grep -qx "$id"; then
+            docker stop "$id" >/dev/null 2>&1 || true
+            log_info "Stopping Docker container '$id' for service '$shortname'."
             stopped_any=true
         fi
     done
@@ -239,10 +302,10 @@ docker_stop_cmd() {
     fi
 
     # Remove the container so a later start does not collide with the name
-    for n in "${targets[@]:-}"; do
-        if docker_any_exists "$n"; then
-            docker rm -f "$n" >/dev/null 2>&1 || true
-            log_info "Removed Docker container '$n' for service '$shortname'."
+    for id in "${ids[@]:-}"; do
+        if [[ -n "$id" ]]; then
+            docker rm -f "$id" >/dev/null 2>&1 || true
+            log_info "Removed Docker container '$id' for service '$shortname'."
         fi
     done
 }
@@ -288,6 +351,14 @@ get_service_state() {
     wrapper_pid=$(pgrep -P "$screen_pid" 2>/dev/null | head -n 1 || true)
 
     if [[ -n "$wrapper_pid" ]]; then
+        # Docker services are never wrapped in a scmn restart loop anymore, so a
+        # sleeping child is internal to the docker client (e.g. attach idle),
+        # never a restart cooldown. Report straight RUNNING.
+        if cmd_is_docker "$cmd"; then
+            echo "RUNNING"
+            return 0
+        fi
+
         local child_pids
         child_pids=$(pgrep -P "$wrapper_pid" 2>/dev/null || true)
 
@@ -328,6 +399,10 @@ start_service() {
     env_vars=$(echo "$env_vars" | xargs)
     auto_restart=$(echo "$auto_restart" | xargs)
 
+    # Raw command as configured; the state file signature must match what reload
+    # reads from the config (the injected docker flags are runtime-only).
+    local raw_cmd="$cmd"
+
     # Validate directory
     if [[ -n "$dir" && "$dir" != "-" ]]; then
         if [[ ! -d "$dir" ]]; then
@@ -336,21 +411,26 @@ start_service() {
         fi
     fi
 
-    # Docker integration: ensure a deterministic container name so containers
-    # are findable for stopping, and remove stale containers before starting.
+    # A detached docker container may outlive its screen session (docker run -d
+    # returns immediately). Treat an already-running container as "running" so
+    # cron/start/reload never tears a healthy container down to restart it.
+    if cmd_is_docker "$cmd" && docker_any_container_running "$cmd" "$name"; then
+        log_info "Service '$name' is already running as a Docker container."
+        return 0
+    fi
+
+    # Docker integration: ensure a deterministic container name AND a tracking
+    # label so containers are findable for stopping, and remove stale ones
+    # before starting.
     if cmd_is_docker "$cmd"; then
-        if ! docker_cmd_has_name "$cmd"; then
-            cmd=$(docker_inject_name "$cmd" "$name")
-            log_info "Service '$name' uses 'docker run' without --name; injecting --name $(docker_service_name "$name")"
-        fi
-        local old_name
-        while IFS= read -r old_name; do
-            [[ -n "$old_name" ]] || continue
-            if docker_any_exists "$old_name"; then
-                log_warn "Removing leftover Docker container '$old_name' for service '$name' before start."
-                docker rm -f "$old_name" >/dev/null 2>&1 || true
-            fi
-        done < <(docker_cmd_names "$cmd" "$name")
+        cmd=$(docker_inject_start_flags "$cmd" "$name")
+        log_info "Service '$name' uses docker run; ensured --label $(docker_label_value "$name") [$(docker_service_name "$name")]"
+        local old_id
+        while IFS= read -r old_id; do
+            [[ -n "$old_id" ]] || continue
+            log_warn "Removing leftover Docker container '$old_id' for service '$name' before start."
+            docker rm -f "$old_id" >/dev/null 2>&1 || true
+        done < <(docker_matched_ids "$cmd" "$name" all)
     fi
 
     # Build screen command (-U for UTF-8 mode, -h for scrollback buffer)
@@ -387,7 +467,13 @@ start_service() {
             ;;
     esac
 
-    if [[ "$restart_mode" == "always" ]]; then
+    # Docker services are NEVER wrapped in a restart loop: `docker run` collides
+    # with the still-running container (--name taken) and would fail forever,
+    # spawning docker client processes instead of supervising. Docker containers
+    # are restarted by the engine's own --restart policy instead.
+    if cmd_is_docker "$cmd"; then
+        exec_cmd="${exec_cmd}$cmd"
+    elif [[ "$restart_mode" == "always" ]]; then
         exec_cmd="${exec_cmd}while true; do $cmd; echo '[scmn] Process exited. Restarting in 2s...'; sleep 2; done"
     elif [[ "$restart_mode" == "on-failure" ]]; then
         exec_cmd="${exec_cmd}while true; do $cmd; _code=\$?; if [ \$_code -eq 0 ]; then echo '[scmn] Process exited cleanly (exit code 0). Stopping.'; break; fi; echo \"[scmn] Process failed (exit code \$_code). Restarting in 2s...\"; sleep 2; done"
@@ -415,21 +501,29 @@ start_service() {
     if [[ "$initial_state" == "RUNNING" ]]; then
         local statedir
         statedir=$(get_state_dir)
-        echo "${dir}|${cmd}|${logfile}|${env_vars}|${auto_restart}" > "$statedir/$name.state" 2>/dev/null || true
+        echo "${dir}|${raw_cmd}|${logfile}|${env_vars}|${auto_restart}" > "$statedir/$name.state" 2>/dev/null || true
         log_success "Started service '$name' (Command: $cmd)"
         log_event "OK" "Started service '$name' (Command: $cmd)"
     elif [[ "$initial_state" == "RESTARTING" ]]; then
         local statedir
         statedir=$(get_state_dir)
-        echo "${dir}|${cmd}|${logfile}|${env_vars}|${auto_restart}" > "$statedir/$name.state" 2>/dev/null || true
+        echo "${dir}|${raw_cmd}|${logfile}|${env_vars}|${auto_restart}" > "$statedir/$name.state" 2>/dev/null || true
         log_warn "Started session for '$name', but command failed/is restarting (Command: $cmd)"
         log_event "WARN" "Started session for '$name', but command failed/is restarting (Command: $cmd)"
     elif is_running "$name"; then
         local statedir
         statedir=$(get_state_dir)
-        echo "${dir}|${cmd}|${logfile}|${env_vars}|${auto_restart}" > "$statedir/$name.state" 2>/dev/null || true
+        echo "${dir}|${raw_cmd}|${logfile}|${env_vars}|${auto_restart}" > "$statedir/$name.state" 2>/dev/null || true
         log_success "Started service '$name' (Command: $cmd)"
         log_event "OK" "Started service '$name' (Command: $cmd)"
+    elif [[ "$initial_state" == "ORPHANED" ]]; then
+        # Docker run -d returns immediately: the container is the service and
+        # runs under dockerd even though the screen session has already ended.
+        local statedir
+        statedir=$(get_state_dir)
+        echo "${dir}|${raw_cmd}|${logfile}|${env_vars}|${auto_restart}" > "$statedir/$name.state" 2>/dev/null || true
+        log_success "Started service '$name' as detached Docker container (Command: $cmd)"
+        log_event "OK" "Started service '$name' as detached Docker container (Command: $cmd)"
     else
         log_error "Failed to start service '$name'."
         log_event "ERROR" "Failed to start service '$name'."
@@ -638,14 +732,28 @@ format_uptime() {
     fi
 }
 
+# Convert seconds to an etime-style string for format_uptime
+secs_to_etime() {
+    local s="${1:-0}" d h m
+    s=$((10#$s))
+    d=$((s / 86400)); s=$((s % 86400))
+    h=$((s / 3600));  s=$((s % 3600))
+    m=$((s / 60));    s=$((s % 60))
+    if (( d > 0 )); then
+        printf "%d-%02d:%02d:%02d\n" "$d" "$h" "$m" "$s"
+    else
+        printf "%02d:%02d:%02d\n" "$h" "$m" "$s"
+    fi
+}
+
 # Command: List status of all configured services with metrics
 cmd_status() {
     ensure_config
     log_info "Configuration file: ${CONFIG_FILE}"
     echo
-    printf "${BOLD}%-14s %-10s %-7s %-6s %-10s %-10s %-27s %s${NC}\n" \
+    printf "${BOLD}%-14s %-10s %-12s %-6s %-10s %-10s %-27s %s${NC}\n" \
         "SHORTNAME" "STATUS" "PID" "RAM" "UPTIME" "RESTART" "COMMAND" "LOGFILE"
-    printf "%s\n" "--------------------------------------------------------------------------------------------------------------------------"
+    printf "%s\n" "--------------------------------------------------------------------------------------------------------------------------------"
 
     status_callback() {
         local name="$1"
@@ -699,7 +807,24 @@ cmd_status() {
                 status_colored="${GREEN}RUNNING${NC}   "
                 local main_pid
                 main_pid=$(get_session_pid "$name")
-                if [[ -n "$main_pid" ]]; then
+                if cmd_is_docker "$cmd"; then
+                    # Docker: report the container itself (docker run client is
+                    # just an attach proxy under dockerd, not the workload).
+                    local cid
+                    cid=$(docker_matched_ids "$cmd" "$name" running | head -n 1)
+                    if [[ -n "$cid" ]]; then
+                        pid_str="${cid:0:12}"
+                        local cup crm
+                        cup=$(docker_container_uptime "$cid")
+                        if [[ -n "$cup" && "$cup" != "-" ]]; then
+                            uptime_str=$(format_uptime "$(secs_to_etime "$cup")")
+                        fi
+                        crm=$(docker_container_ram "$cid")
+                        if [[ -n "$crm" && "$crm" != "-" ]]; then
+                            ram_str="$(echo "$crm" | tr -d ' ')"
+                        fi
+                    fi
+                elif [[ -n "$main_pid" ]]; then
                     local child_pid
                     child_pid=$(pgrep -P "$main_pid" 2>/dev/null | head -n 1 || true)
                     local target_pid="${child_pid:-$main_pid}"
@@ -729,15 +854,11 @@ cmd_status() {
             elif [[ "$state" == "ORPHANED" ]]; then
                 # Visible width: 10 chars ("ORPHANED" + 2 spaces)
                 status_colored="${YELLOW}ORPHANED${NC}  "
-                local oname cid
-                while IFS= read -r oname; do
-                    [[ -n "$oname" ]] || continue
-                    cid=$(docker_container_id "$oname")
-                    if [[ -n "$cid" ]]; then
-                        pid_str="${cid:0:8}"
-                        break
-                    fi
-                done < <(docker_cmd_names "$cmd" "$name")
+                local oid
+                oid=$(docker_matched_ids "$cmd" "$name" running | head -n 1)
+                if [[ -n "$oid" ]]; then
+                    pid_str="${oid:0:8}"
+                fi
             else
                 # Visible width: 10 chars ("STOPPED" + 3 spaces)
                 status_colored="${RED}STOPPED${NC}   "
@@ -751,10 +872,10 @@ cmd_status() {
             *) restart_display="no" ;;
         esac
 
-        printf "%-14s %b %-7s %-6s %-10s %-10s %-27s %s\n" \
+        printf "%-14s %b %-12s %-6s %-10s %-10s %-27s %s\n" \
             "${name:0:13}" \
             "$status_colored" \
-            "${pid_str:0:6}" \
+            "${pid_str:0:12}" \
             "${ram_str:0:5}" \
             "${uptime_str:0:9}" \
             "${restart_display:0:13}" \
@@ -1223,10 +1344,17 @@ cmd_reload() {
 
     # Step 2: Start enabled services that are not running
     for name in "${!configured_enabled[@]}"; do
-        if ! is_running "$name"; then
+        local state_of
+        state_of=$(get_service_state "$name" "${service_cmd[$name]:-}")
+        if [[ "$state_of" == "STOPPED" || -z "$state_of" ]]; then
             log_info "Starting missing service '$name'..."
             start_service "$name" "${service_dir[$name]}" "${service_cmd[$name]}" "${service_log[$name]}" "${service_env[$name]}" "${service_restart[$name]}"
             started_count=$((started_count + 1))
+        elif [[ "$state_of" == "RUNNING" || "$state_of" == "ORPHANED" ]]; then
+            log_info "Service '$name' is already running (state: $state_of)."
+            unchanged_count=$((unchanged_count + 1))
+        else
+            log_info "Service '$name' is '${state_of}'. Skipping."
         fi
     done
 
@@ -1349,11 +1477,21 @@ cmd_check() {
                 fi
             fi
 
-            # Docker check: without --name, scmn injects a deterministic name
-            if cmd_is_docker "$cmd" && ! docker_cmd_has_name "$cmd"; then
-                local docker_name_hint
+            # Docker check: label is always injected; a deterministic --name is
+            # injected when none is given.
+            if cmd_is_docker "$cmd"; then
+                local docker_name_hint docker_label_hint
                 docker_name_hint=$(docker_service_name "$name")
-                warnings+=("Line $line_num: Service '$name' uses 'docker run' without '--name'. scmn will inject '--name $docker_name_hint'. An explicit '--name' is recommended.")
+                docker_label_hint=$(docker_label_value "$name")
+                if ! docker_cmd_has_name "$cmd"; then
+                    warnings+=("Line $line_num: Service '$name' uses 'docker run' without '--name'. scmn will inject '--name $docker_name_hint' and '--label $docker_label_hint'. An explicit '--name' is recommended.")
+                fi
+                # auto_restart is ignored for docker; the engine handles restarts.
+                case "$(echo "$auto_restart" | tr '[:upper:]' '[:lower:]')" in
+                    always|true|1|yes|on-failure|on_failure|failure|fail)
+                        warnings+=("Line $line_num: Service '$name' is Docker-based; scmn ignores auto_restart='$auto_restart'. Use the Docker --restart policy to control restarts.")
+                        ;;
+                esac
             fi
         fi
 
@@ -1631,6 +1769,174 @@ cmd_cron() {
     esac
 }
 
+# Command: Docker container management (`scmn docker orphans [--clean]`)
+cmd_docker() {
+    local subcmd="${1:-}"
+
+    case "$subcmd" in
+        orphans|list)
+            shift || true
+            cmd_docker_orphans "$@"
+            ;;
+        *)
+            log_error "Unknown docker subcommand '${subcmd:-}'. Available: orphans"
+            exit 1
+            ;;
+    esac
+}
+
+# List (and optionally clean) running docker containers that scmn does not
+# supervise: containers whose screen session is gone (ORPHANED) or containers
+# that were never tracked by a label/known name (UNTRACKED).
+cmd_docker_orphans() {
+    local clean=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --clean|-c)
+                clean="true"
+                ;;
+            *)
+                log_error "Unknown option '$1'. Usage: scmn docker orphans [--clean]"
+                return 1
+                ;;
+        esac
+        shift
+    done
+
+    if ! command -v docker >/dev/null 2>&1; then
+        log_error "Docker is not available on this system."
+        return 1
+    fi
+
+    # Collect configured docker services: label value/name -> shortname
+    local -A label_owner=()
+    local -A name_owner=()
+    collect_docker_orphans_cb() {
+        local name="$1"
+        local dir="$2"
+        local cmd="$3"
+        if cmd_is_docker "$cmd"; then
+            label_owner["$name"]="$name"
+            local cn
+            while IFS= read -r cn; do
+                [[ -n "$cn" ]] && name_owner["$cn"]="$name"
+            done < <(docker_cmd_names "$cmd" "$name")
+        fi
+    }
+
+    if find_config; then
+        parse_config collect_docker_orphans_cb "true"
+    else
+        log_info "No configuration file found; scanning conventions only (scmn.service-labels and scmn_* names)."
+    fi
+
+    echo
+    log_info "Scanning running Docker containers..."
+    echo "--------------------------------------------------------------------------------"
+    printf "${BOLD}%-20s %-10s %-9s %-24s %s${NC}\n" "NAME" "STATUS" "CONTAINER" "IMAGE" "NOTE"
+    printf "%s\n" "--------------------------------------------------------------------------------"
+
+    local -a orphan_ids=()
+    local -a untracked=()
+    local orphan_count=0 untracked_count=0 managed_count=0
+
+    local rows
+    rows=$(docker ps --format '{{.Names}}\t{{.ID}}\t{{.Label "scmn.service"}}\t{{.Image}}' 2>/dev/null)
+
+    if [[ -z "$rows" ]]; then
+        log_info "No running Docker containers."
+        return 0
+    fi
+
+    # cut (unlike bash read with IFS) preserves empty tab-separated fields, so
+    # containers without a label are parsed correctly.
+    local row
+    while IFS= read -r row; do
+        [[ -n "$row" ]] || continue
+        local cname cid label image
+        cname=$(cut -d$'\t' -f1 <<<"$row")
+        cid=$(cut -d$'\t' -f2 <<<"$row")
+        label=$(cut -d$'\t' -f3 <<<"$row")
+        image=$(cut -d$'\t' -f4 <<<"$row")
+        [[ -n "$cid" ]] || continue
+
+        if [[ -n "$label" ]]; then
+            local owner
+            owner="${label_owner[$label]:-}"
+            if [[ -n "$owner" ]] && is_running "$owner"; then
+                managed_count=$((managed_count + 1))
+                printf "%-20s %b %-9s %-24s %s\n" "${cname:0:20}" "${CYAN}MANAGED${NC}   " "${cid:0:9}" "${image:0:24}" "service '$owner'"
+                continue
+            fi
+            # Label present but no live session -> orphaned
+            orphan_count=$((orphan_count + 1))
+            orphan_ids+=("$cid")
+            printf "%-20s %b %-9s %-24s %s\n" "${cname:0:20}" "${YELLOW}ORPHANED${NC}  " "${cid:0:9}" "${image:0:24}" "label ${label}"
+        elif [[ "$cname" == scmn_* ]]; then
+            # scmn-created container (convention) without a live session
+            orphan_count=$((orphan_count + 1))
+            orphan_ids+=("$cid")
+            printf "%-20s %b %-9s %-24s %s\n" "${cname:0:20}" "${YELLOW}ORPHANED${NC}  " "${cid:0:9}" "${image:0:24}" "scmn-named, no session"
+        elif [[ -n "${name_owner[$cname]:-}" ]]; then
+            local owner2
+            owner2="${name_owner[$cname]}"
+            if is_running "$owner2"; then
+                managed_count=$((managed_count + 1))
+                printf "%-20s %b %-9s %-24s %s\n" "${cname:0:20}" "${CYAN}MANAGED${NC}   " "${cid:0:9}" "${image:0:24}" "service '$owner2'"
+            else
+                orphan_count=$((orphan_count + 1))
+                orphan_ids+=("$cid")
+                printf "%-20s %b %-9s %-24s %s\n" "${cname:0:20}" "${YELLOW}ORPHANED${NC}  " "${cid:0:9}" "${image:0:24}" "service '$owner2'"
+            fi
+        else
+            untracked_count=$((untracked_count + 1))
+            untracked+=("$cid|$cname")
+            local inote="${image:-unknown image}"
+            printf "%-20s %b %-9s %-24s %s\n" "${cname:0:20}" "${GRAY}UNTRACKED${NC} " "${cid:0:9}" "${inote:0:24}" "no scmn label"
+        fi
+    done < <(printf "%s\n" "$rows")
+
+    echo "--------------------------------------------------------------------------------"
+    log_info "Summary: ${CYAN}${managed_count}${NC} managed, ${YELLOW}${orphan_count}${NC} orphaned, ${GRAY}${untracked_count}${NC} untracked."
+
+    if (( orphan_count == 0 && untracked_count == 0 )); then
+        log_info "Nothing to clean."
+        return 0
+    fi
+
+    if [[ -z "$clean" ]]; then
+        log_warn "Orphaned containers are left running. Re-run with '--clean' to stop/remove ORPHANED containers."
+        log_info "UNTRACKED containers are never removed automatically."
+        return 0
+    fi
+
+    # Cleanup: stop + remove ORPHANED containers owned by scmn.
+    local cid
+    for cid in "${orphan_ids[@]:-}"; do
+        [[ -n "$cid" ]] || continue
+        docker stop "$cid" >/dev/null 2>&1 || true
+        docker rm -f "$cid" >/dev/null 2>&1 || true
+        log_success "Removed orphaned Docker container '$cid'."
+    done
+
+    # UNTRACKED containers: ask before touching (they may be unrelated).
+    local entry
+    for entry in "${untracked[@]:-}"; do
+        [[ -n "$entry" ]] || continue
+        local ucid uname
+        ucid="${entry%%|*}"
+        uname="${entry#*|}"
+        read -r -p "Stop & remove untracked container '$uname' ($ucid)? [y/N] " ans
+        if [[ "$ans" == "y" || "$ans" == "Y" ]]; then
+            docker stop "$ucid" >/dev/null 2>&1 || true
+            docker rm -f "$ucid" >/dev/null 2>&1 || true
+            log_success "Removed untracked Docker container '$uname'."
+        else
+            log_info "Kept untracked container '$uname'."
+        fi
+    done
+}
+
 show_help() {
     echo -e "${BOLD}scmn ${VERSION} - Simple Screen Service Manager${NC}"
     echo
@@ -1658,6 +1964,7 @@ show_help() {
     echo "  scmn cron install              Installs cron job (runs 'scmn' every 15 minutes)"
     echo "  scmn cron uninstall            Removes cron job from crontab"
     echo "  scmn cron status               Displays status of the cron job"
+    echo "  scmn docker orphans [--clean]  Lists/cleans orphaned docker containers"
     echo "  scmn version                   Displays version information"
     echo "  scmn help                      Displays this help message"
     echo
@@ -1761,6 +2068,10 @@ main() {
         cron)
             shift
             cmd_cron "${1:-status}"
+            ;;
+        docker)
+            shift
+            cmd_docker "$@"
             ;;
         version|-V|--version)
             echo "scmn ${VERSION}"

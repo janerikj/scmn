@@ -1,4 +1,4 @@
-# scmn (v0.9.0)
+# scmn (v0.10.0)
 
 > A lightweight, zero-daemon Linux service manager built on top of GNU Screen.
 
@@ -9,7 +9,7 @@
 ## Key Features
 
 - **Zero-Daemon Architecture**: Consumes **0 MB RAM** at idle. Only executes when invoked directly or periodically via cron.
-- **Docker Integration**: Services launched via `docker run` get a deterministic `--name` (injected automatically), and `stop`/`restart`/`reload` also stops and removes the underlying containers — no orphaned containers left behind when the screen session dies.
+- **Docker Integration**: Services launched via `docker run` are tracked by a `scmn.service` label (injected automatically) plus a deterministic `--name`. `stop`/`restart`/`reload` also stops and removes the underlying containers — no orphaned containers left behind when the screen session dies.
 - **Interactive Attach/Detach**: Seamlessly jump into any service's console using native GNU Screen (`Ctrl+A`, then `D` to detach).
 - **Smart Config Sync (`reload`)**: Hot-reloads configuration—starts missing services, restarts changed services, and stops disabled/removed services without unnecessary restarts.
 - **Config Validation (`check`)**: Validates syntax, duplicate names, paths, executables, and restart policies before deployment.
@@ -166,15 +166,22 @@ When attaching to a service (`scmn attach <shortname>`), `scmn` displays a statu
 ### 6. Docker-based Services (`docker run`)
 `docker run` does **not** run your application as a child of the `docker run` client — the container executes under the Docker daemon (`dockerd`). Killing the screen session only kills the client, so the container would keep running. `scmn` therefore treats docker services specially:
 
-- On **start**, `scmn` automatically injects `--name scmn_<shortname>` (lowercased) into `docker run` commands that lack an explicit `--name`. Any leftover container with the same name is removed first, so restarts never collide.
-- On **stop / restart / reload**, `scmn` also stops and removes the containers belonging to the service (`docker stop`, then `docker rm -f`).
-- If the screen session is gone but a container still runs, `scmn status` shows the service as **`ORPHANED`** instead of `STOPPED`.
+- On **start**, `scmn` automatically injects a tracking label `--label scmn.service=<shortname>` and, when the command lacks an explicit `--name`, a deterministic `--name scmn_<shortname>` (lowercased). Label-based tracking means containers are findable even if they end up with random names (e.g. leftovers started before docker support existed).
+- On **stop / restart / reload**, `scmn` also stops and removes the containers belonging to the service (`docker stop`, then `docker rm -f`), matched by label or name.
+- If the screen session is gone but a container still runs, `scmn status` shows the service as **`ORPHANED`** with the container ID as its PID (instead of `STOPPED`).
+- Docker services are **never wrapped in a restart loop** (running `docker run` again while the container lives would collide on `--name` and fail forever). Use the Docker **`--restart`** policy in the command to control restarts — e.g. `docker run --restart unless-stopped --name mybot myimage:latest`.
+- `scmn status` for a running docker service reports the **container's** memory and uptime (via `docker stats`/`docker inspect`), not the `docker run` client's.
 
-Recommended docker service definition (explicit name is clearest):
+Recommended docker service definition (loops and restart policies are handled by Docker):
 
 ```text
-mybot | /app | docker run --rm --name mybot myimage:latest | /var/log/mybot.log | - | always
+mybot | /app | docker run --restart unless-stopped --name mybot myimage:latest | /var/log/mybot.log | - | no
 ```
+
+**`scmn docker orphans [--clean]`** lists running containers that `scmn` does not supervise:
+- **MANAGED** — container has a live screen session (healthy).
+- **ORPHANED** — container carries a `scmn.service` label / `scmn_` name but its screen session is gone; `--clean` stops and removes these automatically.
+- **UNTRACKED** — no scmn label/name at all; these are probably unrelated containers and are never touched without an interactive per-container confirmation.
 
 > These notes apply to plain `docker run` / `docker container run`. Compose-style stacks (`docker compose up`) are not tracked per-service; stop the stack with `docker compose down`.
 
