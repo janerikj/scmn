@@ -88,6 +88,7 @@ ping_bot | - | ping -i 2 1.1.1.1 | none | - | false
 | `scmn cron install` | Installs 15-minute watchdog cron job into crontab |
 | `scmn cron uninstall` | Removes watchdog cron job from crontab |
 | `scmn cron status` | Checks if the watchdog cron job is active |
+| `scmn docker orphans [--clean]` | Lists/cleans orphaned docker containers | 
 | `scmn version` (or `-V`, `--version`) | Displays version information |
 | `scmn help` (or `-h`, `--help`) | Displays help message |
 
@@ -161,7 +162,7 @@ MAX_LOG_SIZE_MB=100 scmn
 ```
 
 ### 5. Console Status Bar & Scrollback Buffer
-When attaching to a service (`scmn attach <shortname>`), `scmn` displays a status bar at the bottom of the screen with the service name, detach shortcut (`Ctrl+A D`), hostname, and time. Sessions automatically run in **UTF-8 mode (`-U`)** with **1000 lines of scrollback buffer in RAM** (customizable via `SCMN_SCROLLBACK=5000`).
+When attaching to a service (`scmn attach <shortname>`), `scmn` displays a status bar at the bottom of the screen with the service name, detach shortcut (`Ctrl+A D`), hostname, and time. Sessions automatically run in **UTF-8 mode (`-U`)** with **1000 lines of scrollback buffer in RAM** (customizable via `SCMN_SCROLLBACK=5000`). To enable scrollback and copy mode: press `Ctrl+A Esc`.
 
 ### 6. Docker-based Services (`docker run`)
 `docker run` does **not** run your application as a child of the `docker run` client — the container executes under the Docker daemon (`dockerd`). Killing the screen session only kills the client, so the container would keep running. `scmn` therefore treats docker services specially:
