@@ -1,4 +1,4 @@
-# scmn (v0.8.1)
+# scmn (v0.9.0)
 
 > A lightweight, zero-daemon Linux service manager built on top of GNU Screen.
 
@@ -9,6 +9,7 @@
 ## Key Features
 
 - **Zero-Daemon Architecture**: Consumes **0 MB RAM** at idle. Only executes when invoked directly or periodically via cron.
+- **Docker Integration**: Services launched via `docker run` get a deterministic `--name` (injected automatically), and `stop`/`restart`/`reload` also stops and removes the underlying containers — no orphaned containers left behind when the screen session dies.
 - **Interactive Attach/Detach**: Seamlessly jump into any service's console using native GNU Screen (`Ctrl+A`, then `D` to detach).
 - **Smart Config Sync (`reload`)**: Hot-reloads configuration—starts missing services, restarts changed services, and stops disabled/removed services without unnecessary restarts.
 - **Config Validation (`check`)**: Validates syntax, duplicate names, paths, executables, and restart policies before deployment.
@@ -161,6 +162,21 @@ MAX_LOG_SIZE_MB=100 scmn
 
 ### 5. Console Status Bar & Scrollback Buffer
 When attaching to a service (`scmn attach <shortname>`), `scmn` displays a status bar at the bottom of the screen with the service name, detach shortcut (`Ctrl+A D`), hostname, and time. Sessions automatically run in **UTF-8 mode (`-U`)** with **1000 lines of scrollback buffer in RAM** (customizable via `SCMN_SCROLLBACK=5000`).
+
+### 6. Docker-based Services (`docker run`)
+`docker run` does **not** run your application as a child of the `docker run` client — the container executes under the Docker daemon (`dockerd`). Killing the screen session only kills the client, so the container would keep running. `scmn` therefore treats docker services specially:
+
+- On **start**, `scmn` automatically injects `--name scmn_<shortname>` (lowercased) into `docker run` commands that lack an explicit `--name`. Any leftover container with the same name is removed first, so restarts never collide.
+- On **stop / restart / reload**, `scmn` also stops and removes the containers belonging to the service (`docker stop`, then `docker rm -f`).
+- If the screen session is gone but a container still runs, `scmn status` shows the service as **`ORPHANED`** instead of `STOPPED`.
+
+Recommended docker service definition (explicit name is clearest):
+
+```text
+mybot | /app | docker run --rm --name mybot myimage:latest | /var/log/mybot.log | - | always
+```
+
+> These notes apply to plain `docker run` / `docker container run`. Compose-style stacks (`docker compose up`) are not tracked per-service; stop the stack with `docker compose down`.
 
 ---
 

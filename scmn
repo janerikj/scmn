@@ -9,7 +9,7 @@
 set -euo pipefail
 
 # Application version
-VERSION="v0.8.1"
+VERSION="v0.9.0"
 
 # Ensure SCREENDIR is set and safe (prevents permission issues on some Linux setups)
 if [[ -z "${SCREENDIR:-}" ]]; then
@@ -113,7 +113,154 @@ is_running() {
 # Helper: Get PID of a screen session by shortname
 get_session_pid() {
     local name="$1"
-    screen -ls 2>/dev/null | grep -E "\.[0-9A-Za-z_-]*${name}\b" | awk '{print $1}' | cut -d'.' -f1 | head -n 1
+    screen -ls 2>/dev/null | grep -E "\.[0-9A-Za-z_-]*${name}\b" | awk '{print $1}' | cut -d'.' -f1 | head -n 1 || true
+}
+
+# -----------------------------------------------------------------------------
+# Docker integration helpers.
+#
+# `docker run` executes the actual container under dockerd, NOT as a child of
+# the `docker run` client process. Killing the screen session (and the docker
+# client) therefore leaves the container running. scmn detects docker services
+# and gives each one a deterministic container name so it can be stopped and
+# removed together with the screen session.
+# -----------------------------------------------------------------------------
+
+# Detect whether a service command launches a Docker container
+cmd_is_docker() {
+    local cmd="$1"
+    grep -qE 'docker( container)?[[:space:]]+run' <<<"$cmd"
+}
+
+# Checks if a docker command already defines a container name via --name
+docker_cmd_has_name() {
+    local cmd="$1"
+    grep -qE -- '--name(=|$|[[:space:]])' <<<"$cmd"
+}
+
+# Deterministic container name derived from the service shortname
+docker_service_name() {
+    echo "scmn_$(echo "$1" | tr '[:upper:]' '[:lower:]')"
+}
+
+# Inject `--name scmn_<shortname>` into a docker run command that lacks it
+docker_inject_name() {
+    local cmd="$1"
+    local shortname="$2"
+    local inject
+    inject=$(docker_service_name "$shortname")
+    echo "$cmd" | sed -E "s/docker( container)? run/docker\1 run --name ${inject}/"
+}
+
+# Extract all container names explicitly set via --name in the command
+docker_names_from_cmd() {
+    local cmd="$1"
+    local match val
+    while IFS= read -r match; do
+        [[ -z "$match" ]] && continue
+        if [[ "$match" == --name=* ]]; then
+            val="${match#--name=}"
+        else
+            val="${match#--name }"
+        fi
+        val=$(echo "$val" | xargs)
+        [[ -n "$val" ]] && echo "$val"
+    done < <(grep -oE -- '--name=([^[:space:]|]+)|--name[[:space:]]+[^[:space:]|]+' <<<"$cmd")
+}
+
+# All candidate container names for a service: explicit ones + deterministic default
+docker_cmd_names() {
+    local cmd="$1"
+    local shortname="$2"
+    docker_names_from_cmd "$cmd"
+    docker_service_name "$shortname"
+}
+
+# Container ID of a running container by exact name (empty if not running)
+docker_container_id() {
+    local name="$1"
+    docker ps --format '{{.Names}}\t{{.ID}}' 2>/dev/null | awk -F'\t' -v n="$name" '$1==n {print $2}' | head -n 1
+}
+
+# True if a container exists (running or stopped) with this exact name
+docker_any_exists() {
+    local name="$1"
+    docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$name"
+}
+
+# True if any candidate container for the service is currently running
+docker_any_container_running() {
+    local cmd="$1"
+    local shortname="$2"
+    local n
+    if ! command -v docker >/dev/null 2>&1; then
+        return 1
+    fi
+    while IFS= read -r n; do
+        [[ -n "$n" ]] || continue
+        if [[ -n "$(docker_container_id "$n")" ]]; then
+            return 0
+        fi
+    done < <(docker_cmd_names "$cmd" "$shortname")
+    return 1
+}
+
+# Stop (and remove) all containers belonging to a docker service
+docker_stop_cmd() {
+    local cmd="$1"
+    local shortname="$2"
+    if ! command -v docker >/dev/null 2>&1; then
+        log_warn "Docker not available; cannot stop containers for service '$shortname'."
+        return 0
+    fi
+
+    local -A seen=()
+    local -a targets=()
+    local n
+    while IFS= read -r n; do
+        [[ -n "$n" ]] || continue
+        if [[ -z "${seen[$n]:-}" ]]; then
+            seen[$n]=1
+            targets+=("$n")
+        fi
+    done < <(docker_cmd_names "$cmd" "$shortname")
+
+    local stopped_any=false
+    for n in "${targets[@]:-}"; do
+        if [[ -n "$(docker_container_id "$n")" ]]; then
+            docker stop "$n" >/dev/null 2>&1 || true
+            log_info "Stopping Docker container '$n' for service '$shortname'."
+            stopped_any=true
+        fi
+    done
+
+    if $stopped_any; then
+        sleep 1
+    fi
+
+    # Remove the container so a later start does not collide with the name
+    for n in "${targets[@]:-}"; do
+        if docker_any_exists "$n"; then
+            docker rm -f "$n" >/dev/null 2>&1 || true
+            log_info "Removed Docker container '$n' for service '$shortname'."
+        fi
+    done
+}
+
+# Look up the configured command for a service shortname (empty if not found)
+get_service_cmd() {
+    local target="$1"
+    local result=""
+    get_cmd_callback() {
+        local n="$1"
+        local d="$2"
+        local c="$3"
+        if [[ "$n" == "$target" ]]; then
+            result="$c"
+        fi
+    }
+    parse_config get_cmd_callback "true"
+    echo "$result"
 }
 
 # Helper: Check service runtime state ("RUNNING", "RESTARTING", or "STOPPED")
@@ -122,6 +269,10 @@ get_service_state() {
     local cmd="${2:-}"
 
     if ! is_running "$name"; then
+        if cmd_is_docker "$cmd" && docker_any_container_running "$cmd" "$name"; then
+            echo "ORPHANED"
+            return 0
+        fi
         echo "STOPPED"
         return 0
     fi
@@ -183,6 +334,23 @@ start_service() {
             log_error "Directory '$dir' for service '$name' does not exist!"
             return 1
         fi
+    fi
+
+    # Docker integration: ensure a deterministic container name so containers
+    # are findable for stopping, and remove stale containers before starting.
+    if cmd_is_docker "$cmd"; then
+        if ! docker_cmd_has_name "$cmd"; then
+            cmd=$(docker_inject_name "$cmd" "$name")
+            log_info "Service '$name' uses 'docker run' without --name; injecting --name $(docker_service_name "$name")"
+        fi
+        local old_name
+        while IFS= read -r old_name; do
+            [[ -n "$old_name" ]] || continue
+            if docker_any_exists "$old_name"; then
+                log_warn "Removing leftover Docker container '$old_name' for service '$name' before start."
+                docker rm -f "$old_name" >/dev/null 2>&1 || true
+            fi
+        done < <(docker_cmd_names "$cmd" "$name")
     fi
 
     # Build screen command (-U for UTF-8 mode, -h for scrollback buffer)
@@ -558,6 +726,18 @@ cmd_status() {
                 if [[ -n "$main_pid" ]]; then
                     pid_str="$main_pid"
                 fi
+            elif [[ "$state" == "ORPHANED" ]]; then
+                # Visible width: 10 chars ("ORPHANED" + 2 spaces)
+                status_colored="${YELLOW}ORPHANED${NC}  "
+                local oname cid
+                while IFS= read -r oname; do
+                    [[ -n "$oname" ]] || continue
+                    cid=$(docker_container_id "$oname")
+                    if [[ -n "$cid" ]]; then
+                        pid_str="${cid:0:8}"
+                        break
+                    fi
+                done < <(docker_cmd_names "$cmd" "$name")
             else
                 # Visible width: 10 chars ("STOPPED" + 3 spaces)
                 status_colored="${RED}STOPPED${NC}   "
@@ -600,11 +780,21 @@ cmd_status() {
 
 }
 
-# Stop a single service with graceful SIGTERM and force-kill SIGKILL fallback
+# Stop a single service with graceful SIGTERM, SIGKILL fallback, and
+# Docker container cleanup (docker containers survive screen termination).
 stop_service_by_name() {
     local name="$1"
+    local cmd="${2:-}"
+    local is_docker=false
 
-    if ! is_running "$name"; then
+    if [[ -z "$cmd" ]]; then
+        cmd=$(get_service_cmd "$name")
+    fi
+    if [[ -n "$cmd" ]] && cmd_is_docker "$cmd"; then
+        is_docker=true
+    fi
+
+    if ! is_running "$name" && ! $is_docker; then
         log_warn "Service '$name' is not running."
         return 0
     fi
@@ -612,38 +802,54 @@ stop_service_by_name() {
     local pid
     pid=$(get_session_pid "$name")
 
-    # Step 1: Send graceful shutdown signal via screen quit (SIGTERM)
-    screen -X -S "$name" quit 2>/dev/null || true
+    if [[ -n "$pid" ]]; then
+        # Step 1: Send graceful shutdown signal via screen quit (SIGTERM)
+        screen -X -S "$name" quit 2>/dev/null || true
 
-    # Step 2: Wait up to 2 seconds (10 steps of 0.2s) for clean termination
-    local waited=0
-    local max_wait=10
-    while is_running "$name" && (( waited < max_wait )); do
-        sleep 0.2
-        waited=$((waited + 1))
-    done
+        # Step 2: Wait up to 2 seconds (10 steps of 0.2s) for clean termination
+        local waited=0
+        local max_wait=10
+        while is_running "$name" && (( waited < max_wait )); do
+            sleep 0.2
+            waited=$((waited + 1))
+        done
 
-    # Step 3: Check if still running; if so, force kill (SIGKILL)
-    if is_running "$name"; then
-        log_warn "Service '$name' did not stop gracefully within 2s. Force killing (SIGKILL)..."
-        log_event "WARN" "Service '$name' did not stop gracefully within 2s. Force killing (SIGKILL)."
-        if [[ -n "$pid" ]]; then
+        # Step 3: Check if still running; if so, force kill (SIGKILL)
+        if is_running "$name"; then
+            log_warn "Service '$name' did not stop gracefully within 2s. Force killing (SIGKILL)..."
+            log_event "WARN" "Service '$name' did not stop gracefully within 2s. Force killing (SIGKILL)."
             # Kill child processes inside screen session first, then screen itself
             pkill -9 -P "$pid" 2>/dev/null || true
             kill -9 "$pid" 2>/dev/null || true
+            screen -wipe 2>/dev/null || true
+            sleep 0.2
         fi
-        screen -wipe 2>/dev/null || true
-        sleep 0.2
     fi
 
-    if ! is_running "$name"; then
+    # Step 4: Stop/remove Docker containers launched by this service. `docker
+    # run` executes the container under dockerd, not under the screen session's
+    # process tree, so it keeps running even when the screen session is gone.
+    if $is_docker; then
+        docker_stop_cmd "$cmd" "$name"
+    fi
+
+    local screen_stopped=true
+    local docker_stopped=true
+    if is_running "$name"; then
+        screen_stopped=false
+    fi
+    if $is_docker && docker_any_container_running "$cmd" "$name"; then
+        docker_stopped=false
+    fi
+
+    if $screen_stopped && $docker_stopped; then
         local statedir
         statedir=$(get_state_dir)
         rm -f "$statedir/$name.state" 2>/dev/null || true
         log_success "Stopped service '$name'."
         log_event "OK" "Stopped service '$name'."
     else
-        log_error "Failed to stop service '$name' even with SIGKILL."
+        log_error "Failed to stop service '$name' (screen running: $screen_stopped, docker running: $docker_stopped)."
         log_event "ERROR" "Failed to stop service '$name' even with SIGKILL."
     fi
 }
@@ -873,9 +1079,14 @@ cmd_stop() {
         local stopped_any=false
         stop_all_callback() {
             local name="$1"
+            local dir="$2"
+            local cmd="$3"
             if is_running "$name"; then
                 stopped_any=true
-                stop_service_by_name "$name"
+                stop_service_by_name "$name" "$cmd"
+            elif cmd_is_docker "$cmd" && docker_any_container_running "$cmd" "$name"; then
+                stopped_any=true
+                stop_service_by_name "$name" "$cmd"
             fi
         }
         parse_config stop_all_callback "true"
@@ -916,7 +1127,7 @@ cmd_restart() {
                 if [[ "$is_disabled" == "true" ]]; then
                     log_warn "Service '$target' is disabled in configuration. Use 'scmn enable $target --now' to enable and restart it."
                     if is_running "$target"; then
-                        stop_service_by_name "$target"
+                        stop_service_by_name "$target" "$cmd"
                     fi
                     return 0
                 fi
@@ -1136,6 +1347,13 @@ cmd_check() {
                         warnings+=("Line $line_num: Command '$primary_bin' for service '$name' not found in PATH.")
                     fi
                 fi
+            fi
+
+            # Docker check: without --name, scmn injects a deterministic name
+            if cmd_is_docker "$cmd" && ! docker_cmd_has_name "$cmd"; then
+                local docker_name_hint
+                docker_name_hint=$(docker_service_name "$name")
+                warnings+=("Line $line_num: Service '$name' uses 'docker run' without '--name'. scmn will inject '--name $docker_name_hint'. An explicit '--name' is recommended.")
             fi
         fi
 
