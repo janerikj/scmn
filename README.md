@@ -1,4 +1,4 @@
-# scmn (v0.11.1)
+# scmn (v0.12.0)
 
 > A lightweight, zero-daemon Linux service manager built on top of GNU Screen.
 
@@ -171,6 +171,7 @@ When attaching to a service (`scmn attach <shortname>`), `scmn` displays a statu
 - On **start**, `scmn` automatically injects a tracking label `--label scmn.service=<shortname>` and, when the command lacks an explicit `--name`, a deterministic `--name scmn_<shortname>` (lowercased). Label-based tracking means containers are findable even if they end up with random names (e.g. leftovers started before docker support existed).
 - On **stop / restart / reload**, `scmn` also stops and removes the containers belonging to the service (`docker stop`, then `docker rm -f`), matched by label or name.
 - If the screen session is gone but a container still runs, `scmn status` shows the service as **`ORPHANED`** with the container ID as its PID (instead of `STOPPED`).
+- **Self-healing supervision**: for *foreground* containers (no `-d`), `scmn start`/`scmn reload`/cron and `scmn attach` automatically re-create the supervising screen session with `docker attach` when the container still runs but its session was lost (e.g. after a `docker.service` restart) — so status returns to `RUNNING` and attach keeps working. Detached (`docker run -d`) services intentionally stay unsupervised.
 - Docker services are **never wrapped in a restart loop** (running `docker run` again while the container lives would collide on `--name` and fail forever). Use the Docker **`--restart`** policy in the command to control restarts — e.g. `docker run --restart unless-stopped --name mybot myimage:latest`.
 - `scmn status` for a running docker service reports the **container's** memory and uptime (via `docker stats`/`docker inspect`), not the `docker run` client's.
 

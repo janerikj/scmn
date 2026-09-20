@@ -9,7 +9,7 @@
 set -euo pipefail
 
 # Application version
-VERSION="v0.11.1"
+VERSION="v0.12.0"
 
 # Ensure SCREENDIR is set and safe (prevents permission issues on some Linux setups)
 if [[ -z "${SCREENDIR:-}" ]]; then
@@ -181,6 +181,21 @@ cmd_is_docker() {
     grep -qE 'docker( container)?[[:space:]]+run' <<<"$cmd"
 }
 
+# True when a docker run command runs detached (-d / --detach). Such services
+# intentionally have no supervising screen session.
+docker_cmd_is_detached() {
+    local cmd="$1" arg
+    local -a tokens=()
+    IFS=' ' read -r -a tokens <<<"$cmd"
+    for arg in "${tokens[@]:-}"; do
+        case "$arg" in
+            -d|--detach) return 0 ;;
+            -d*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
 # Checks if a docker command already defines a container name via --name
 docker_cmd_has_name() {
     local cmd="$1"
@@ -219,6 +234,30 @@ docker_inject_start_flags() {
     else
         echo "$cmd"
     fi
+}
+
+# Re-create the supervising screen session for a running foreground container
+# whose session was lost (e.g. after a docker.service restart). Uses
+# `docker attach` which re-links the container's stdio for status/attach.
+docker_restore_supervision() {
+    local name="$1" cid="$2" dir="$3" cmd="$4" logfile="$5" env_vars="$6" auto_restart="$7"
+    local scrollback="${SCMN_SCROLLBACK:-1000}"
+
+    screen -U -h "$scrollback" -dmS "$name" docker attach --sig-proxy=false "$cid"
+    screen -S "$name" -X caption always "%{= kc}[scmn: $name]%{= kw} | Detach: %{= ky}Ctrl+A D%{= kw} | Host: %H | %c" 2>/dev/null || true
+
+    sleep 0.4
+    screen_snapshot_refresh
+    docker_query_invalidate
+
+    if is_running "$name"; then
+        state_write "$name" "$dir" "$cmd" "$logfile" "$env_vars" "$auto_restart"
+        log_success "Restored screen supervision for running container '$name' ($cid)."
+        log_event "OK" "Restored screen supervision for running container '$name'"
+        return 0
+    fi
+    log_warn "Could not restore screen supervision for '$name' (container $cid)."
+    return 1
 }
 
 # Extract all container names explicitly set via --name in the command
@@ -577,6 +616,16 @@ start_service() {
     # returns immediately). Treat an already-running container as "running" so
     # cron/start/reload never tears a healthy container down to restart it.
     if cmd_is_docker "$cmd" && docker_any_container_running "$cmd" "$name"; then
+        # Foreground container with a dead screen (e.g. after a docker.service
+        # restart): re-attach supervision instead of leaving it unsupervised.
+        if ! is_running "$name" && ! docker_cmd_is_detached "$cmd"; then
+            local restore_cid
+            restore_cid=$(docker_matched_ids "$cmd" "$name" running | head -n 1)
+            if [[ -n "$restore_cid" ]]; then
+                docker_restore_supervision "$name" "$restore_cid" "$dir" "$raw_cmd" "$logfile" "$env_vars" "$auto_restart"
+                return 0
+            fi
+        fi
         log_info "Service '$name' is already running as a Docker container."
         return 0
     fi
@@ -1456,12 +1505,32 @@ cmd_attach() {
         exit 1
     fi
 
-    if ! is_running "$target"; then
-        log_error "No active screen session found for service '$target'."
-        exit 1
+    if is_running "$target"; then
+        exec screen -r "$target"
     fi
 
-    exec screen -r "$target"
+    # Docker fallback: a foreground container can still be running while its
+    # supervising screen session is gone (e.g. after a docker.service restart).
+    # Restore supervision and attach to it.
+    ensure_config
+    load_services
+    local cmd="${SVC_CMD[$target]:-}"
+    if [[ -n "$cmd" ]] && cmd_is_docker "$cmd" && ! docker_cmd_is_detached "$cmd"; then
+        local cid
+        cid=$(docker_matched_ids "$cmd" "$target" running | head -n 1)
+        if [[ -n "$cid" ]]; then
+            log_info "Container '$target' is still running; restoring screen supervision for attach..."
+            if docker_restore_supervision "$target" "$cid" \
+                "${SVC_DIR[$target]:-}" "$cmd" \
+                "${SVC_LOG[$target]:-}" "${SVC_ENV[$target]:-}" "${SVC_RESTART[$target]:-}"; then
+                exec screen -r "$target"
+            fi
+            exit 1
+        fi
+    fi
+
+    log_error "No active screen session found for service '$target'."
+    exit 1
 }
 
 # Command: Send input / command directly to service stdin

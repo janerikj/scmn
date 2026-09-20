@@ -146,6 +146,12 @@ do_stats() {
     fi
 }
 
+do_attach() {
+    while :; do
+        sleep 0.1
+    done
+}
+
 cmd="${1:-}"
 shift || true
 log_call "$cmd $*"
@@ -157,6 +163,7 @@ case "$cmd" in
     rm) do_rm "$@" ;;
     inspect) do_inspect "$@" ;;
     stats) do_stats "$@" ;;
+    attach) do_attach "$@" ;;
     version) printf 'Docker version 24.0.0, build mock\n' ;;
     *) exit 1 ;;
 esac

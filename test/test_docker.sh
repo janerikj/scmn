@@ -96,6 +96,19 @@ assert_match "$fout" "Status: +RUNNING"
 assert_match "$(grep '^Screen session:' <<<"$fout")" "pid [0-9]+ +RAM [0-9]+MB +up.*(screen)"
 assert_match "$(grep '^Container:' <<<"$fout")"      "pid [-0-9]+ +RAM - +up [0-9]{2}:[0-9]{2}:[0-9]{2}.*\(a[0-9]{11}\)"
 
+echo "== J: restore supervision of an orphaned foreground container =="
+SCREENDIR="$TMP/.screen" screen -S foreground -X quit >/dev/null 2>&1 || true
+sleep 0.6
+jout=$(run_scmn status foreground 2>&1)
+assert_match "$(grep '^Status:' <<<"$jout")" "ORPHANED"
+run_scmn start foreground >/dev/null 2>&1
+sleep 0.6
+jout=$(run_scmn status foreground 2>&1)
+assert_match "$(grep '^Status:' <<<"$jout")" "RUNNING"
+assert_match "$(SCREENDIR="$TMP/.screen" screen -ls 2>/dev/null)" "\.foreground\b"
+run_scmn start detached >/dev/null 2>&1
+assert_not_match "$(SCREENDIR="$TMP/.screen" screen -ls 2>/dev/null)" "\.detached\b"
+
 echo "== D: check warnings =="
 cout=$(run_scmn check 2>&1)
 assert_match "$cout" "without '--name'"
