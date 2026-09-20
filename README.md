@@ -1,4 +1,4 @@
-# scmn (v0.11.0)
+# scmn (v0.11.1)
 
 > A lightweight, zero-daemon Linux service manager built on top of GNU Screen.
 

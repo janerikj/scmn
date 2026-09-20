@@ -9,7 +9,7 @@
 set -euo pipefail
 
 # Application version
-VERSION="v0.11.0"
+VERSION="v0.11.1"
 
 # Ensure SCREENDIR is set and safe (prevents permission issues on some Linux setups)
 if [[ -z "${SCREENDIR:-}" ]]; then
@@ -1966,6 +1966,7 @@ cmd_log() {
 
         log_info "Showing last $lines lines from scmn log ($manager_log):"
         echo "--------------------------------------------------------------------------------"
+        echo "Press Ctrl+C to exit the log view."
         tail -n "$lines" -f "$manager_log"
         return 0
     fi
@@ -1995,6 +1996,7 @@ cmd_log() {
 
     log_info "Showing the last $lines lines from $target_logfile:"
     echo "--------------------------------------------------------------------------------"
+    echo "Press Ctrl+C to exit the log view."
     tail -n "$lines" -f "$target_logfile"
 }
 
