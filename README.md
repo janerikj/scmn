@@ -1,4 +1,4 @@
-# scmn (v0.10.0)
+# scmn (v0.11.0)
 
 > A lightweight, zero-daemon Linux service manager built on top of GNU Screen.
 
@@ -75,6 +75,7 @@ ping_bot | - | ping -i 2 1.1.1.1 | none | - | false
 | :--- | :--- |
 | `scmn [start] [shortname]` | Starts missing services (or a single specified service) |
 | `scmn status` (or `ls`) | Displays table with service status, PID, RAM, Uptime, and config |
+| `scmn status <shortname>` | Detailed status page for one service: screen session + workload process (or container) RAM & uptime |
 | `scmn reload` | Syncs running services with config (starts missing, restarts changed, stops disabled/removed) |
 | `scmn check` | Validates configuration file syntax, paths, binaries, and policies |
 | `scmn enable <shortname> [--now]` | Enables service in config (uncomments line); starts immediately with `--now` |
@@ -191,6 +192,8 @@ mybot | /app | docker run --restart unless-stopped --name mybot myimage:latest |
 ## AI Disclosure
 
 Google Antigravity did the heavy coding.
+
+Assisted and reviewed by big pickle (opencode).
 
 ---
 

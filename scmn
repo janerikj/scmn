@@ -9,7 +9,7 @@
 set -euo pipefail
 
 # Application version
-VERSION="v0.10.0"
+VERSION="v0.11.0"
 
 # Ensure SCREENDIR is set and safe (prevents permission issues on some Linux setups)
 if [[ -z "${SCREENDIR:-}" ]]; then
@@ -100,20 +100,69 @@ ensure_config() {
     fi
 }
 
+# Screen session snapshot: parse `screen -ls` once per command so
+# is_running/get_session_pid become in-memory lookups (each `screen -ls` call
+# spawns a screen client process, and status called it 2-3 times per service).
+# The snapshot is lazily loaded on first use and refreshed after every screen
+# mutation.
+declare -A SCREEN_SNAPSHOT=()
+SCREEN_SNAPSHOT_LOADED=0
+
+screen_snapshot_parse() {
+    local line pid name
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # screen -ls line: "<pid>.<session_name>\t(Detached)"
+        line="${line#"${line%%[![:space:]]*}"}"
+        if [[ "$line" =~ ^[0-9]+\. ]]; then
+            pid="${line%%.*}"
+            name="${line#*.}"
+            SCREEN_SNAPSHOT["${name%%[[:space:]]*}"]="$pid"
+        fi
+    done
+}
+
+screen_snapshot_load() {
+    SCREEN_SNAPSHOT=()
+    screen_snapshot_parse < <(screen -ls 2>/dev/null || true)
+    SCREEN_SNAPSHOT_LOADED=1
+}
+
+screen_snapshot_refresh() {
+    SCREEN_SNAPSHOT_LOADED=0
+    screen_snapshot_load
+}
+
 # Checks if screen session with exact shortname is running
 is_running() {
     local name="$1"
-    # screen -ls outputs lines like: '\t12345.shortname\t(Detached)'
-    if screen -ls 2>/dev/null | grep -E -q "\.[0-9A-Za-z_-]*${name}\b"; then
-        return 0
+    if [[ $SCREEN_SNAPSHOT_LOADED -eq 0 ]]; then
+        screen_snapshot_load
     fi
-    return 1
+    [[ -n "${SCREEN_SNAPSHOT[$name]:-}" ]]
 }
 
 # Helper: Get PID of a screen session by shortname
 get_session_pid() {
     local name="$1"
-    screen -ls 2>/dev/null | grep -E "\.[0-9A-Za-z_-]*${name}\b" | awk '{print $1}' | cut -d'.' -f1 | head -n 1 || true
+    if [[ $SCREEN_SNAPSHOT_LOADED -eq 0 ]]; then
+        screen_snapshot_load
+    fi
+    printf '%s\n' "${SCREEN_SNAPSHOT[$name]:-}"
+}
+
+# Deepest live descendant pid under $1: the actual workload process below a
+# screen -> bash -c (restart loop) chain. Bounded descent; falls back to $1.
+get_leaf_pid() {
+    local pid="$1"
+    local child
+    local depth=0
+    while (( depth < 10 )); do
+        child=$(pgrep -P "$pid" 2>/dev/null | head -n 1 || true)
+        [[ -n "$child" ]] || break
+        pid="$child"
+        depth=$((depth + 1))
+    done
+    printf '%s\n' "$pid"
 }
 
 # -----------------------------------------------------------------------------
@@ -196,6 +245,55 @@ docker_cmd_names() {
     docker_service_name "$shortname"
 }
 
+# -----------------------------------------------------------------------------
+# Docker query cache: `docker ps` / `docker ps -a` are fetched at most once per
+# command (status/orphans query them repeatedly). Any docker mutation (run,
+# stop, rm) invalidates the cache via docker_query_invalidate().
+# Cache keys are container IDs; values:
+#   RUNNING: "name<TAB>label"          ALL: "name<TAB>status<TAB>label"
+# -----------------------------------------------------------------------------
+declare -A DOCKER_CACHE_RUNNING=()
+declare -A DOCKER_CACHE_ALL=()
+DOCKER_CACHE_LOADED=0
+
+docker_query_load() {
+    [[ $DOCKER_CACHE_LOADED -eq 1 ]] && return 0
+    DOCKER_CACHE_RUNNING=()
+    DOCKER_CACHE_ALL=()
+
+    local line name cid label status
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        name=$(cut -d$'\t' -f1 <<<"$line")
+        cid=$(cut -d$'\t' -f2 <<<"$line")
+        label=$(cut -d$'\t' -f3 <<<"$line")
+        DOCKER_CACHE_RUNNING["$cid"]="$name"$'\t'"$label"
+    done < <(docker ps --format '{{.Names}}\t{{.ID}}\t{{.Label "scmn.service"}}' 2>/dev/null || true)
+
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        name=$(cut -d$'\t' -f1 <<<"$line")
+        cid=$(cut -d$'\t' -f2 <<<"$line")
+        status=$(cut -d$'\t' -f3 <<<"$line")
+        label=$(cut -d$'\t' -f4 <<<"$line")
+        DOCKER_CACHE_ALL["$cid"]="$name"$'\t'"$status"$'\t'"$label"
+    done < <(docker ps -a --format '{{.Names}}\t{{.ID}}\t{{.Status}}\t{{.Label "scmn.service"}}' 2>/dev/null || true)
+
+    DOCKER_CACHE_LOADED=1
+}
+
+docker_query_invalidate() {
+    DOCKER_CACHE_LOADED=0
+}
+
+# Exact token match: does space-separated list "$1" contain token "$2"?
+docker_names_contain() {
+    case " $1 " in
+        *" $2 "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # Emit "name<TAB>id" lines for containers belonging to a service: matched by
 # the scmn.service label OR by any container name this service could use
 # (explicit --name in the command, or the deterministic scmn_<shortname>).
@@ -204,22 +302,36 @@ docker_matched() {
     local cmd="$1"
     local shortname="$2"
     local mode="${3:-running}"
-    local names
-    names=$(docker_cmd_names "$cmd" "$shortname")
 
-    local awk_prog='function in_names(n, list, i) {
-        c = split(list, a, " ")
-        for (i = 1; i <= c; i++) if (a[i] == n) return 1
-        return 0
-    }
-    $3 == owner || in_names($1, cache) { print $1 "\t" $2 }'
+    # Candidate names come one per line from docker_cmd_names; join to
+    # space-separated tokens (names never contain spaces) for exact matching.
+    local names=""
+    local nm
+    while IFS= read -r nm; do
+        [[ -n "$nm" ]] && names+=" $nm"
+    done < <(docker_cmd_names "$cmd" "$shortname")
 
+    docker_query_load
+    local cid entry name label
     if [[ "$mode" == "all" ]]; then
-        docker ps -a --format '{{.Names}}\t{{.ID}}\t{{.Label "scmn.service"}}' 2>/dev/null |
-            awk -F'\t' -v owner="$shortname" -v cache="$names" "$awk_prog"
+        for cid in "${!DOCKER_CACHE_ALL[@]}"; do
+            entry="${DOCKER_CACHE_ALL[$cid]}"
+            name="${entry%%$'\t'*}"
+            label="${entry#*$'\t'}"
+            label="${label#*$'\t'}"
+            if [[ "$label" == "$shortname" ]] || docker_names_contain "$names" "$name"; then
+                printf '%s\t%s\n' "$name" "$cid"
+            fi
+        done
     else
-        docker ps --format '{{.Names}}\t{{.ID}}\t{{.Label "scmn.service"}}' 2>/dev/null |
-            awk -F'\t' -v owner="$shortname" -v cache="$names" "$awk_prog"
+        for cid in "${!DOCKER_CACHE_RUNNING[@]}"; do
+            entry="${DOCKER_CACHE_RUNNING[$cid]}"
+            name="${entry%%$'\t'*}"
+            label="${entry#*$'\t'}"
+            if [[ "$label" == "$shortname" ]] || docker_names_contain "$names" "$name"; then
+                printf '%s\t%s\n' "$name" "$cid"
+            fi
+        done
     fi
 }
 
@@ -257,15 +369,70 @@ docker_container_uptime() {
     echo $((now - start_epoch))
 }
 
-# Resident memory of a container (docker stats MemUsage, first field)
+# Resident memory of a container (best effort): cgroup memory.current when
+# available (whole container incl. children), else the container's main
+# process RSS from /proc, else docker stats MemUsage. Emits e.g. "26MB".
+# With arg "strict", only report the whole-container cgroup value; otherwise
+# report "-" (the /proc docker stats approximations are not container RAM).
 docker_container_ram() {
-    local id="$1"
+    local id="$1" strict="${2:-}"
     local mem
+
+    # cgroup v2 memory controller (delegated to the container scope).
+    local full_id cgrp
+    full_id=$(docker inspect -f '{{.Id}}' "$id" 2>/dev/null || true)
+    if [[ -n "$full_id" ]]; then
+        cgrp="/sys/fs/cgroup/system.slice/docker-${full_id}.scope/memory.current"
+        if [[ -r "$cgrp" ]]; then
+            mem=$(cat "$cgrp" 2>/dev/null || true)
+            if [[ -n "$mem" && "$mem" -gt 0 ]] 2>/dev/null; then
+                awk -v bytes="$mem" 'BEGIN{ printf "%dMB\n", bytes/1048576 }'
+                return 0
+            fi
+        fi
+    fi
+
+    # Strict tool: only the true whole-container value (memory.current) counts;
+    # the RSS sums / docker stats below are not container RAM.
+    [[ "$strict" == "strict" ]] && { printf -- '-\n'; return 0; }
+
+    # Lenient fallbacks for callers that accept an approximation:
+    # No memory controller: sum RSS over all container processes
+    # (cgroup.procs), which is more truthful than the main PID alone.
+    if [[ -n "$full_id" ]]; then
+        local scope="/sys/fs/cgroup/system.slice/docker-${full_id}.scope"
+        if [[ -r "$scope/cgroup.procs" ]]; then
+            local total=0 p rss
+            while IFS= read -r p; do
+                [[ -n "$p" ]] || continue
+                rss=$(awk '{ print $2 }' "/proc/$p/statm" 2>/dev/null || true)
+                [[ -n "$rss" ]] && total=$((total + rss))
+            done < "$scope/cgroup.procs"
+            if [[ "$total" -gt 0 ]]; then
+                awk -v pages="$total" 'BEGIN{ printf "%dMB\n", (pages*4096)/1048576 }'
+                return 0
+            fi
+        fi
+    fi
+
+    # Fallback: RSS of the container's main process (PID 1) via /proc.
+    local pid
+    pid=$(docker inspect -f '{{.State.Pid}}' "$id" 2>/dev/null || true)
+    if [[ -n "$pid" && "$pid" != "0" ]] && [[ -r "/proc/$pid/statm" ]]; then
+        local rss_pages
+        rss_pages=$(awk '{ print $2 }' "/proc/$pid/statm" 2>/dev/null || true)
+        if [[ -n "$rss_pages" ]]; then
+            awk -v pages="$rss_pages" 'BEGIN{ printf "%dMB\n", (pages*4096)/1048576 }'
+            return 0
+        fi
+    fi
+
+    # Last resort: docker stats (MemUsage, first field).
     mem=$(docker stats --no-stream --format '{{.MemUsage}}' "$id" 2>/dev/null || true)
     if [[ -n "$mem" ]]; then
-        echo "$mem" | awk '{print $1}'
+        printf '%s\n' "$mem" | awk '{print $1}'
     else
-        echo "-"
+        printf '-\n'
     fi
 }
 
@@ -289,8 +456,9 @@ docker_stop_cmd() {
     fi
 
     local stopped_any=false
+    docker_query_load
     for id in "${ids[@]:-}"; do
-        if [[ -n "$id" ]] && docker ps --format '{{.ID}}' 2>/dev/null | grep -qx "$id"; then
+        if [[ -n "$id" ]] && [[ -n "${DOCKER_CACHE_RUNNING[$id]:-}" ]]; then
             docker stop "$id" >/dev/null 2>&1 || true
             log_info "Stopping Docker container '$id' for service '$shortname'."
             stopped_any=true
@@ -308,22 +476,16 @@ docker_stop_cmd() {
             log_info "Removed Docker container '$id' for service '$shortname'."
         fi
     done
+    docker_query_invalidate
 }
 
 # Look up the configured command for a service shortname (empty if not found)
 get_service_cmd() {
     local target="$1"
-    local result=""
-    get_cmd_callback() {
-        local n="$1"
-        local d="$2"
-        local c="$3"
-        if [[ "$n" == "$target" ]]; then
-            result="$c"
-        fi
-    }
-    parse_config get_cmd_callback "true"
-    echo "$result"
+    if [[ $SERVICES_LOADED -eq 0 ]]; then
+        load_services
+    fi
+    printf '%s\n' "${SVC_CMD[$target]:-}"
 }
 
 # Helper: Check service runtime state ("RUNNING", "RESTARTING", or "STOPPED")
@@ -392,12 +554,12 @@ start_service() {
     fi
 
     # Trim fields
-    name=$(echo "$name" | xargs)
-    dir=$(echo "$dir" | xargs)
-    cmd=$(echo "$cmd" | xargs)
-    logfile=$(echo "$logfile" | xargs)
-    env_vars=$(echo "$env_vars" | xargs)
-    auto_restart=$(echo "$auto_restart" | xargs)
+    name="$(trim "$name")"
+    dir="$(trim "$dir")"
+    cmd="$(trim "$cmd")"
+    logfile="$(trim "$logfile")"
+    env_vars="$(trim "$env_vars")"
+    auto_restart="$(trim "$auto_restart")"
 
     # Raw command as configured; the state file signature must match what reload
     # reads from the config (the injected docker flags are runtime-only).
@@ -431,6 +593,7 @@ start_service() {
             log_warn "Removing leftover Docker container '$old_id' for service '$name' before start."
             docker rm -f "$old_id" >/dev/null 2>&1 || true
         done < <(docker_matched_ids "$cmd" "$name" all)
+        docker_query_invalidate
     fi
 
     # Build screen command (-U for UTF-8 mode, -h for scrollback buffer)
@@ -454,18 +617,10 @@ start_service() {
         exec_cmd="export $env_vars; "
     fi
 
-    local restart_mode="never"
-    case "$(echo "$auto_restart" | tr '[:upper:]' '[:lower:]')" in
-        on-failure|on_failure|failure|fail)
-            restart_mode="on-failure"
-            ;;
-        true|yes|1|always)
-            restart_mode="always"
-            ;;
-        *)
-            restart_mode="never"
-            ;;
-    esac
+    local restart_mode
+    restart_mode="$(normalize_restart "$auto_restart")"
+    restart_mode="$(trim "$restart_mode")"
+    [[ -n "$restart_mode" ]] || restart_mode="never"
 
     # Docker services are NEVER wrapped in a restart loop: `docker run` collides
     # with the still-running container (--name taken) and would fail forever,
@@ -495,33 +650,27 @@ start_service() {
     screen -S "$name" -X caption always "%{= kc}[scmn: $name]%{= kw} | Detach: %{= ky}Ctrl+A D%{= kw} | Host: %H | %c" 2>/dev/null || true
 
     sleep 0.4
+    screen_snapshot_refresh
+    docker_query_invalidate
     local initial_state
     initial_state=$(get_service_state "$name" "$cmd")
 
     if [[ "$initial_state" == "RUNNING" ]]; then
-        local statedir
-        statedir=$(get_state_dir)
-        echo "${dir}|${raw_cmd}|${logfile}|${env_vars}|${auto_restart}" > "$statedir/$name.state" 2>/dev/null || true
+        state_write "$name" "$dir" "$raw_cmd" "$logfile" "$env_vars" "$auto_restart"
         log_success "Started service '$name' (Command: $cmd)"
         log_event "OK" "Started service '$name' (Command: $cmd)"
     elif [[ "$initial_state" == "RESTARTING" ]]; then
-        local statedir
-        statedir=$(get_state_dir)
-        echo "${dir}|${raw_cmd}|${logfile}|${env_vars}|${auto_restart}" > "$statedir/$name.state" 2>/dev/null || true
+        state_write "$name" "$dir" "$raw_cmd" "$logfile" "$env_vars" "$auto_restart"
         log_warn "Started session for '$name', but command failed/is restarting (Command: $cmd)"
         log_event "WARN" "Started session for '$name', but command failed/is restarting (Command: $cmd)"
     elif is_running "$name"; then
-        local statedir
-        statedir=$(get_state_dir)
-        echo "${dir}|${raw_cmd}|${logfile}|${env_vars}|${auto_restart}" > "$statedir/$name.state" 2>/dev/null || true
+        state_write "$name" "$dir" "$raw_cmd" "$logfile" "$env_vars" "$auto_restart"
         log_success "Started service '$name' (Command: $cmd)"
         log_event "OK" "Started service '$name' (Command: $cmd)"
     elif [[ "$initial_state" == "ORPHANED" ]]; then
         # Docker run -d returns immediately: the container is the service and
         # runs under dockerd even though the screen session has already ended.
-        local statedir
-        statedir=$(get_state_dir)
-        echo "${dir}|${raw_cmd}|${logfile}|${env_vars}|${auto_restart}" > "$statedir/$name.state" 2>/dev/null || true
+        state_write "$name" "$dir" "$raw_cmd" "$logfile" "$env_vars" "$auto_restart"
         log_success "Started service '$name' as detached Docker container (Command: $cmd)"
         log_event "OK" "Started service '$name' as detached Docker container (Command: $cmd)"
     else
@@ -569,63 +718,136 @@ truncate_log_if_needed() {
     fi
 }
 
-# Parse config file and execute callback function for each valid service
-# Callback format: fn "name" "dir" "cmd" "logfile" "env" "auto_restart" [is_disabled]
-parse_config() {
-    local callback="$1"
-    local include_disabled="${2:-false}"
+# -----------------------------------------------------------------------------
+# Configuration: parsed ONCE per command into in-memory maps. parse_config()
+# iterates the cached data (no-op after the first load), so commands that
+# inspect the config more than once (status, start --all, reload) no longer
+# re-read the file and re-spawn sed/xargs per line. Call invalidate_services()
+# whenever the config file is replaced.
+# -----------------------------------------------------------------------------
+declare -a SERVICES=()
+declare -A SVC_DIR=() SVC_CMD=() SVC_LOG=() SVC_ENV=() SVC_RESTART=() SVC_DISABLED=() SVC_LINE=()
+SERVICES_LOADED=0
 
+# Trim leading/trailing whitespace (pure bash; no sed/xargs subprocesses)
+trim() {
+    local s="$1"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "$s"
+}
+
+# Lowercase a string (subprocess only when argument is non-empty)
+lower() {
+    [[ -n "$1" ]] && printf '%s' "${1,,}" || printf '%s' "$1"
+}
+
+# Canonical auto_restart policy: "always" | "on-failure" | "never".
+# Empty string on unknown/unsupported input (so callers can warn).
+normalize_restart() {
+    case "$(lower "${1:-}")" in
+        always|true|1|yes) printf 'always' ;;
+        on-failure|on_failure|failure|fail) printf 'on-failure' ;;
+        never|false|no|0|-) printf 'never' ;;
+        *) return 1 ;;
+    esac
+}
+
+# Write the runtime state file for a service (dir|cmd|logfile|env|auto_restart)
+state_write() {
+    local name="$1" dir="$2" cmd="$3" logfile="$4" env_vars="$5" auto_restart="$6"
+    printf '%s|%s|%s|%s|%s\n' "$dir" "$cmd" "$logfile" "$env_vars" "$auto_restart" \
+        > "$(get_state_dir)/$name.state" 2>/dev/null || true
+}
+
+# Remove the runtime state file for a service
+state_remove() {
+    rm -f "$(get_state_dir)/$1.state" 2>/dev/null || true
+}
+
+# RAM (MB) and uptime (formatted) for a non-docker pid: emits "ram<TAB>uptime"
+proc_metrics() {
+    local pid="$1"
+    local rss uptime_str
+    rss=$(ps -p "$pid" -o rss= 2>/dev/null | xargs || echo 0)
+    if [[ -n "$rss" && "$rss" -gt 0 ]]; then
+        printf '%dMB\t' "$((rss / 1024))"
+    else
+        printf -- '-\t'
+    fi
+    uptime_str=$(ps -p "$pid" -o etime= 2>/dev/null | xargs || echo "-")
+    if [[ -n "$uptime_str" && "$uptime_str" != "-" ]]; then
+        format_uptime "$uptime_str"
+    else
+        printf -- '-'
+    fi
+}
+
+# RAM (MB) and uptime (formatted) for a docker container id: emits "ram<TAB>uptime"
+docker_metrics() {
+    local cid="$1"
+    local mem
+    mem=$(docker_container_ram "$cid")
+    if [[ -n "$mem" && "$mem" != "-" ]]; then
+        printf '%s\t' "$(printf '%s' "$mem" | tr -d ' ')"
+    else
+        printf -- '-\t'
+    fi
+    local cup
+    cup=$(docker_container_uptime "$cid")
+    if [[ -n "$cup" && "$cup" != "-" ]]; then
+        format_uptime "$(secs_to_etime "$cup")"
+    else
+        printf -- '-'
+    fi
+}
+
+load_services() {
     ensure_config
+    SERVICES=()
+    SVC_DIR=() SVC_CMD=() SVC_LOG=() SVC_ENV=() SVC_RESTART=() SVC_DISABLED=() SVC_LINE=()
 
     local line_num=0
+    local trimmed_line parse_line name dir cmd logfile env_vars auto_restart is_comment is_disabled
     while IFS= read -r line || [[ -n "$line" ]]; do
         line_num=$((line_num + 1))
 
         # Strip leading/trailing whitespace
-        local trimmed_line
-        trimmed_line="$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        trimmed_line="$(trim "$line")"
 
         # Ignore empty lines
-        if [[ -z "$trimmed_line" ]]; then
-            continue
-        fi
+        [[ -n "$trimmed_line" ]] || continue
 
-        local is_comment=false
-        if [[ "$trimmed_line" =~ ^# ]]; then
+        is_comment=false
+        if [[ "$trimmed_line" == \#* ]]; then
             is_comment=true
         fi
 
-        if $is_comment && [[ "$include_disabled" != "true" ]]; then
-            continue
-        fi
-
-        local parse_line="$trimmed_line"
-        local is_disabled="false"
+        parse_line="$trimmed_line"
+        is_disabled=false
         if $is_comment; then
             # Strip leading # and whitespace
-            parse_line="$(echo "$trimmed_line" | sed -e 's/^#[[:space:]]*//')"
-            is_disabled="true"
+            parse_line="$(trim "${trimmed_line#\#}")"
+            is_disabled=true
         fi
 
         # Check if line contains pipe delimiter
-        if [[ "$parse_line" != *"|"* ]]; then
-            continue
-        fi
+        [[ "$parse_line" == *"|"* ]] || continue
 
         # Parse pipe-separated values: shortname|directory|command|logfile|env|auto_restart
-        local name="" dir="" cmd="" logfile="" env_vars="" auto_restart=""
+        name="" dir="" cmd="" logfile="" env_vars="" auto_restart=""
         IFS='|' read -r name dir cmd logfile env_vars auto_restart <<< "$parse_line"
 
-        name=$(echo "${name:-}" | xargs)
-        dir=$(echo "${dir:-}" | xargs)
-        cmd=$(echo "${cmd:-}" | xargs)
-        logfile=$(echo "${logfile:-}" | xargs)
-        env_vars=$(echo "${env_vars:-}" | xargs)
-        auto_restart=$(echo "${auto_restart:-}" | xargs)
+        name="$(trim "${name:-}")"
+        dir="$(trim "${dir:-}")"
+        cmd="$(trim "${cmd:-}")"
+        logfile="$(trim "${logfile:-}")"
+        env_vars="$(trim "${env_vars:-}")"
+        auto_restart="$(trim "${auto_restart:-}")"
 
         # Validate name and command
         if [[ -z "$name" || -z "$cmd" ]]; then
-            if ! $is_comment; then
+            if [[ $is_comment == "false" ]]; then
                 log_warn "Line $line_num in '$CONFIG_FILE' missing shortname or command: $line"
             fi
             continue
@@ -636,8 +858,41 @@ parse_config() {
             continue
         fi
 
-        "$callback" "$name" "$dir" "$cmd" "$logfile" "$env_vars" "$auto_restart" "$is_disabled" || true
+        SERVICES+=("$name")
+        SVC_DIR["$name"]="$dir"
+        SVC_CMD["$name"]="$cmd"
+        SVC_LOG["$name"]="$logfile"
+        SVC_ENV["$name"]="$env_vars"
+        SVC_RESTART["$name"]="$auto_restart"
+        SVC_DISABLED["$name"]="$is_disabled"
+        SVC_LINE["$name"]=$line_num
     done < "$CONFIG_FILE"
+
+    SERVICES_LOADED=1
+}
+
+# Parse config file and execute callback function for each valid service.
+# Callback format: fn "name" "dir" "cmd" "logfile" "env" "auto_restart" [is_disabled]
+parse_config() {
+    local callback="$1"
+    local include_disabled="${2:-false}"
+
+    if [[ $SERVICES_LOADED -eq 0 ]]; then
+        load_services
+    fi
+
+    local name
+    for name in "${SERVICES[@]:-}"; do
+        if [[ "${SVC_DISABLED[$name]}" == "true" && "$include_disabled" != "true" ]]; then
+            continue
+        fi
+        "$callback" "$name" "${SVC_DIR[$name]}" "${SVC_CMD[$name]}" "${SVC_LOG[$name]}" "${SVC_ENV[$name]}" "${SVC_RESTART[$name]}" "${SVC_DISABLED[$name]}" || true
+    done
+}
+
+# Mark the cached service maps stale (call after the config file is rewritten)
+invalidate_services() {
+    SERVICES_LOADED=0
 }
 
 ## Command: Start missing services (all or single target) + truncate logs
@@ -776,23 +1031,12 @@ cmd_status() {
                 local main_pid
                 main_pid=$(get_session_pid "$name")
                 if [[ -n "$main_pid" ]]; then
-                    local child_pid
-                    child_pid=$(pgrep -P "$main_pid" 2>/dev/null | head -n 1 || true)
-                    local target_pid="${child_pid:-$main_pid}"
+                    local target_pid ram_str2 uptime_str2
+                    target_pid=$(get_leaf_pid "$main_pid")
                     pid_str="$target_pid"
-
-                    local rss
-                    rss=$(ps -p "$target_pid" -o rss= 2>/dev/null | xargs || echo 0)
-                    if [[ -n "$rss" && "$rss" -gt 0 ]]; then
-                        ram_str="$((rss / 1024))MB"
-                    fi
-
-                    uptime_str=$(ps -p "$target_pid" -o etime= 2>/dev/null | xargs || echo "-")
-                    if [[ -n "$uptime_str" && "$uptime_str" != "-" ]]; then
-                        uptime_str=$(format_uptime "$uptime_str")
-                    else
-                        uptime_str="-"
-                    fi
+                    IFS=$'\t' read -r ram_str2 uptime_str2 < <(proc_metrics "$target_pid")
+                    ram_str="$ram_str2"
+                    uptime_str="$uptime_str2"
                 fi
             else
                 # Visible width: 10 chars ("DISABLED" + 2 spaces)
@@ -814,34 +1058,18 @@ cmd_status() {
                     cid=$(docker_matched_ids "$cmd" "$name" running | head -n 1)
                     if [[ -n "$cid" ]]; then
                         pid_str="${cid:0:12}"
-                        local cup crm
-                        cup=$(docker_container_uptime "$cid")
-                        if [[ -n "$cup" && "$cup" != "-" ]]; then
-                            uptime_str=$(format_uptime "$(secs_to_etime "$cup")")
-                        fi
-                        crm=$(docker_container_ram "$cid")
-                        if [[ -n "$crm" && "$crm" != "-" ]]; then
-                            ram_str="$(echo "$crm" | tr -d ' ')"
-                        fi
+                        local ram_str2 uptime_str2
+                        IFS=$'\t' read -r ram_str2 uptime_str2 < <(docker_metrics "$cid")
+                        ram_str="$ram_str2"
+                        uptime_str="$uptime_str2"
                     fi
                 elif [[ -n "$main_pid" ]]; then
-                    local child_pid
-                    child_pid=$(pgrep -P "$main_pid" 2>/dev/null | head -n 1 || true)
-                    local target_pid="${child_pid:-$main_pid}"
+                    local target_pid ram_str2 uptime_str2
+                    target_pid=$(get_leaf_pid "$main_pid")
                     pid_str="$target_pid"
-
-                    local rss
-                    rss=$(ps -p "$target_pid" -o rss= 2>/dev/null | xargs || echo 0)
-                    if [[ -n "$rss" && "$rss" -gt 0 ]]; then
-                        ram_str="$((rss / 1024))MB"
-                    fi
-
-                    uptime_str=$(ps -p "$target_pid" -o etime= 2>/dev/null | xargs || echo "-")
-                    if [[ -n "$uptime_str" && "$uptime_str" != "-" ]]; then
-                        uptime_str=$(format_uptime "$uptime_str")
-                    else
-                        uptime_str="-"
-                    fi
+                    IFS=$'\t' read -r ram_str2 uptime_str2 < <(proc_metrics "$target_pid")
+                    ram_str="$ram_str2"
+                    uptime_str="$uptime_str2"
                 fi
             elif [[ "$state" == "RESTARTING" ]]; then
                 # Visible width: 10 chars ("RESTARTING" + 0 spaces)
@@ -857,7 +1085,7 @@ cmd_status() {
                 local oid
                 oid=$(docker_matched_ids "$cmd" "$name" running | head -n 1)
                 if [[ -n "$oid" ]]; then
-                    pid_str="${oid:0:8}"
+                    pid_str="${oid:0:12}"
                 fi
             else
                 # Visible width: 10 chars ("STOPPED" + 3 spaces)
@@ -866,10 +1094,9 @@ cmd_status() {
         fi
 
         local restart_display="no"
-        case "$(echo "$auto_restart" | tr '[:upper:]' '[:lower:]')" in
-            on-failure|on_failure|failure|fail) restart_display="on-failure" ;;
-            true|yes|1|always) restart_display="always" ;;
-            *) restart_display="no" ;;
+        case "$(normalize_restart "$auto_restart")" in
+            on-failure) restart_display="on-failure" ;;
+            always) restart_display="always" ;;
         esac
 
         printf "%-14s %b %-12s %-6s %-10s %-10s %-27s %s\n" \
@@ -899,6 +1126,125 @@ cmd_status() {
 
     parse_config check_logs_callback
 
+}
+
+# One aligned metrics row for the detail page:
+# "LABEL  pid X     RAM Y     up Z     (tag)"
+detail_metrics_row() {
+    local label="$1" pid="$2" ram="$3" up="$4" tag="${5:-}"
+    printf '%-18s pid %-8s RAM %-7s up %-10s (%s)\n' \
+        "$label" "${pid:--}" "${ram:--}" "${up:--}" "${tag:--}"
+}
+
+# One process row (RAM/uptime from /proc, process name as tag).
+detail_proc_row() {
+    local label="$1" pid="$2" tag="${3:-}"
+    local ram up comm
+    if [[ -n "$tag" ]]; then
+        comm="$tag"
+    else
+        comm=$(ps -o comm= -p "$pid" 2>/dev/null | xargs || true)
+    fi
+    IFS=$'\t' read -r ram up < <(proc_metrics "$pid")
+    detail_metrics_row "$label" "$pid" "$ram" "$up" "$comm"
+}
+
+# Command: Detailed status page for a single service showing both the screen
+# session and the workload process (or docker container) metrics.
+cmd_status_detail() {
+    local name="${1:-}"
+    if [[ -z "$name" ]]; then
+        log_error "Please specify a service shortname."
+        log_info "Usage: scmn status <shortname>"
+        exit 1
+    fi
+
+    ensure_config
+    load_services
+
+    if [[ -z "${SVC_LINE[$name]:-}" && -z "${SVC_CMD[$name]:-}" ]]; then
+        log_error "Service '$name' not found in configuration file '${CONFIG_FILE}'."
+        exit 1
+    fi
+
+    local cmd="${SVC_CMD[$name]:-}"
+    local dir="${SVC_DIR[$name]:--}"
+    local logfile="${SVC_LOG[$name]:-}"
+    local auto_restart="${SVC_RESTART[$name]:-false}"
+    local disabled="${SVC_DISABLED[$name]:-false}"
+
+    local restart_display="no"
+    case "$(normalize_restart "$auto_restart")" in
+        on-failure) restart_display="on-failure" ;;
+        always) restart_display="always" ;;
+    esac
+
+    local state
+    state=$(get_service_state "$name" "$cmd")
+    local status_label="$state"
+    if [[ "$disabled" == "true" ]]; then
+        if [[ "$state" == "STOPPED" ]]; then
+            status_label="DISABLED"
+        else
+            status_label="${state} (disabled)"
+        fi
+    fi
+
+    local is_docker=false
+    [[ -n "$cmd" ]] && cmd_is_docker "$cmd" && is_docker=true
+
+    echo
+    printf '%-18s %s\n' "Service:" "$name"
+    printf '%-18s %s\n' "Status:" "$status_label"
+    printf '%-18s %s\n' "Working dir:" "${dir:--}"
+    printf '%-18s %s\n' "Command:" "$cmd"
+    printf '%-18s %s\n' "Logfile:" "${logfile:-none}"
+    printf '%-18s %s\n' "Auto-restart:" "$restart_display"
+    echo
+
+    local screen_pid
+    screen_pid=$(get_session_pid "$name")
+
+    if $is_docker; then
+        local cid
+        cid=$(docker_matched_ids "$cmd" "$name" running | head -n 1)
+        if [[ -z "$cid" ]]; then
+            cid=$(docker_matched_ids "$cmd" "$name" all | head -n 1)
+        fi
+        if [[ -n "$screen_pid" ]]; then
+            detail_proc_row "Screen session:" "$screen_pid"
+        else
+            printf '%-18s not running\n' "Screen session:"
+        fi
+        if [[ -n "$cid" ]]; then
+            local cpid dram dupt
+            cpid=$(docker inspect -f '{{.State.Pid}}' "$cid" 2>/dev/null || true)
+            [[ -z "$cpid" || "$cpid" == "0" ]] && cpid="-"
+            dram=$(docker_container_ram "$cid" strict)
+            dupt=$(docker_container_uptime "$cid")
+            if [[ -n "$dupt" && "$dupt" != "-" ]]; then
+                dupt=$(format_uptime "$(secs_to_etime "$dupt")")
+            fi
+            detail_metrics_row "Container:" "$cpid" "$dram" "${dupt:--}" "${cid:0:12}"
+            if [[ "$cpid" != "-" ]]; then
+                detail_proc_row "Workload proc:" "$cpid"
+            else
+                printf '%-18s not running\n' "Workload proc:"
+            fi
+        else
+            printf '%-18s not running\n' "Container:"
+            printf '%-18s not running\n' "Workload proc:"
+        fi
+    else
+        if [[ -n "$screen_pid" ]]; then
+            detail_proc_row "Screen session:" "$screen_pid"
+            detail_proc_row "Workload proc:" "$(get_leaf_pid "$screen_pid")"
+        else
+            printf '%-18s not running\n' "Screen session:"
+            printf '%-18s not running\n' "Workload proc:"
+        fi
+    fi
+    echo
 }
 
 # Stop a single service with graceful SIGTERM, SIGKILL fallback, and
@@ -932,6 +1278,7 @@ stop_service_by_name() {
         local max_wait=10
         while is_running "$name" && (( waited < max_wait )); do
             sleep 0.2
+            screen_snapshot_refresh
             waited=$((waited + 1))
         done
 
@@ -944,6 +1291,7 @@ stop_service_by_name() {
             kill -9 "$pid" 2>/dev/null || true
             screen -wipe 2>/dev/null || true
             sleep 0.2
+            screen_snapshot_refresh
         fi
     fi
 
@@ -964,9 +1312,7 @@ stop_service_by_name() {
     fi
 
     if $screen_stopped && $docker_stopped; then
-        local statedir
-        statedir=$(get_state_dir)
-        rm -f "$statedir/$name.state" 2>/dev/null || true
+        state_remove "$name"
         log_success "Stopped service '$name'."
         log_event "OK" "Stopped service '$name'."
     else
@@ -977,93 +1323,21 @@ stop_service_by_name() {
 
 # Command: Enable a disabled service in config (uncomment) and optionally start immediately (--now)
 cmd_enable() {
-    local target=""
-    local now=false
-
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --now)
-                now=true
-                shift
-                ;;
-            *)
-                if [[ -z "$target" ]]; then
-                    target="$1"
-                fi
-                shift
-                ;;
-        esac
-    done
-
-    if [[ -z "$target" ]]; then
-        log_error "Please specify the service shortname to enable!"
-        log_info "Usage: scmn enable <shortname> [--now]"
-        exit 1
-    fi
-
-    ensure_config
-
-    if [[ ! -w "$CONFIG_FILE" ]]; then
-        log_error "Configuration file '$CONFIG_FILE' is not writable. Check permissions (or run with sudo)."
-        exit 1
-    fi
-
-    local temp_file
-    temp_file=$(mktemp "${CONFIG_FILE}.tmp.XXXXXX" 2>/dev/null || mktemp -t scmn_conf.XXXXXX)
-
-    local found=false
-    local already_enabled=false
-
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        local trimmed
-        trimmed="$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-
-        # Check if active: ^target[[:space:]]*\|
-        if [[ "$trimmed" =~ ^${target}[[:space:]]*\| ]]; then
-            found=true
-            already_enabled=true
-            echo "$line" >> "$temp_file"
-        # Check if commented/disabled: ^#[[:space:]]*target[[:space:]]*\|
-        elif [[ "$trimmed" =~ ^#[[:space:]]*${target}[[:space:]]*\| ]]; then
-            found=true
-            # Remove leading '#' and optional space after '#'
-            local uncommented
-            uncommented="$(echo "$line" | sed -E 's/^([[:space:]]*)#[[:space:]]?/\1/')"
-            echo "$uncommented" >> "$temp_file"
-        else
-            echo "$line" >> "$temp_file"
-        fi
-    done < "$CONFIG_FILE"
-
-    if ! $found; then
-        rm -f "$temp_file"
-        log_error "Service '$target' not found in configuration file '${CONFIG_FILE}'."
-        exit 1
-    fi
-
-    if $already_enabled; then
-        rm -f "$temp_file"
-        log_warn "Service '$target' is already enabled in '${CONFIG_FILE}'."
-        if $now; then
-            cmd_start "$target"
-        fi
-        return 0
-    fi
-
-    mv "$temp_file" "$CONFIG_FILE"
-    log_success "Enabled service '$target' in ${CONFIG_FILE}."
-    log_event "OK" "Enabled service '$target' in ${CONFIG_FILE}."
-
-    if $now; then
-        log_info "Starting service '$target' (--now)..."
-        cmd_start "$target"
-    fi
+    cmd_toggle enable "$@"
 }
 
 # Command: Disable an enabled service in config (comment out) and optionally stop immediately (--now)
 cmd_disable() {
+    cmd_toggle disable "$@"
+}
+
+# Shared implementation for enable/disable. action: "enable" | "disable"
+cmd_toggle() {
+    local action="${1:-}"
     local target=""
     local now=false
+    [[ "$action" == "enable" ]] && local enable=true || local enable=false
+    shift
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -1081,8 +1355,8 @@ cmd_disable() {
     done
 
     if [[ -z "$target" ]]; then
-        log_error "Please specify the service shortname to disable!"
-        log_info "Usage: scmn disable <shortname> [--now]"
+        log_error "Please specify the service shortname to $(lower "$action")!"
+        log_info "Usage: scmn $action <shortname> [--now]"
         exit 1
     fi
 
@@ -1097,26 +1371,42 @@ cmd_disable() {
     temp_file=$(mktemp "${CONFIG_FILE}.tmp.XXXXXX" 2>/dev/null || mktemp -t scmn_conf.XXXXXX)
 
     local found=false
-    local already_disabled=false
+    local already_done=false
 
     while IFS= read -r line || [[ -n "$line" ]]; do
         local trimmed
-        trimmed="$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        trimmed="$(trim "$line")"
 
-        # Check if disabled: ^#[[:space:]]*target[[:space:]]*\|
-        if [[ "$trimmed" =~ ^#[[:space:]]*${target}[[:space:]]*\| ]]; then
-            found=true
-            already_disabled=true
-            echo "$line" >> "$temp_file"
-        # Check if active: ^target[[:space:]]*\|
-        elif [[ "$trimmed" =~ ^${target}[[:space:]]*\| ]]; then
-            found=true
-            # Prefix with '# ' while preserving leading whitespace
-            local commented
-            commented="$(echo "$line" | sed -E 's/^([[:space:]]*)/\1# /')"
-            echo "$commented" >> "$temp_file"
+        if $enable; then
+            # Enable: uncomment a disabled (#target|) line; leave active lines as-is
+            if [[ "$trimmed" =~ ^${target}[[:space:]]*\| ]]; then
+                found=true
+                already_done=true
+                echo "$line" >> "$temp_file"
+            elif [[ "$trimmed" =~ ^#[[:space:]]*${target}[[:space:]]*\| ]]; then
+                found=true
+                # Remove leading '#' and optional space after '#'
+                local uncommented
+                uncommented="$(echo "$line" | sed -E 's/^([[:space:]]*)#[[:space:]]?/\1/')"
+                echo "$uncommented" >> "$temp_file"
+            else
+                echo "$line" >> "$temp_file"
+            fi
         else
-            echo "$line" >> "$temp_file"
+            # Disable: comment out an active (target|) line; leave disabled lines as-is
+            if [[ "$trimmed" =~ ^#[[:space:]]*${target}[[:space:]]*\| ]]; then
+                found=true
+                already_done=true
+                echo "$line" >> "$temp_file"
+            elif [[ "$trimmed" =~ ^${target}[[:space:]]*\| ]]; then
+                found=true
+                # Prefix with '# ' while preserving leading whitespace
+                local commented
+                commented="$(echo "$line" | sed -E 's/^([[:space:]]*)/\1# /')"
+                echo "$commented" >> "$temp_file"
+            else
+                echo "$line" >> "$temp_file"
+            fi
         fi
     done < "$CONFIG_FILE"
 
@@ -1126,21 +1416,29 @@ cmd_disable() {
         exit 1
     fi
 
-    if $already_disabled; then
+    if $already_done; then
         rm -f "$temp_file"
-        log_warn "Service '$target' is already disabled in '${CONFIG_FILE}'."
-        if $now && is_running "$target"; then
-            stop_service_by_name "$target"
+        log_warn "Service '$target' is already $(lower "$action")d in '${CONFIG_FILE}'."
+        if $now; then
+            if $enable; then
+                cmd_start "$target"
+            elif is_running "$target"; then
+                stop_service_by_name "$target"
+            fi
         fi
         return 0
     fi
 
     mv "$temp_file" "$CONFIG_FILE"
-    log_success "Disabled service '$target' in ${CONFIG_FILE}."
-    log_event "OK" "Disabled service '$target' in ${CONFIG_FILE}."
+    invalidate_services
+    log_success "${action^}d service '$target' in ${CONFIG_FILE}."
+    log_event "OK" "${action^}d service '$target' in ${CONFIG_FILE}."
 
     if $now; then
-        if is_running "$target"; then
+        if $enable; then
+            log_info "Starting service '$target' (--now)..."
+            cmd_start "$target"
+        elif is_running "$target"; then
             log_info "Stopping active service '$target' (--now)..."
             stop_service_by_name "$target"
         else
@@ -1393,7 +1691,7 @@ cmd_check() {
         line_num=$((line_num + 1))
 
         local trimmed
-        trimmed="$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        trimmed="$(trim "$line")"
 
         if [[ -z "$trimmed" ]]; then
             continue
@@ -1407,7 +1705,7 @@ cmd_check() {
         local parse_line="$trimmed"
         local is_disabled=false
         if $is_comment; then
-            parse_line="$(echo "$trimmed" | sed -e 's/^#[[:space:]]*//')"
+            parse_line="$(trim "${trimmed#\#}")"
             is_disabled=true
         fi
 
@@ -1419,12 +1717,12 @@ cmd_check() {
         local name="" dir="" cmd="" logfile="" env_vars="" auto_restart=""
         IFS='|' read -r name dir cmd logfile env_vars auto_restart <<< "$parse_line"
 
-        name=$(echo "${name:-}" | xargs)
-        dir=$(echo "${dir:-}" | xargs)
-        cmd=$(echo "${cmd:-}" | xargs)
-        logfile=$(echo "${logfile:-}" | xargs)
-        env_vars=$(echo "${env_vars:-}" | xargs)
-        auto_restart=$(echo "${auto_restart:-}" | xargs)
+        name="$(trim "${name:-}")"
+        dir="$(trim "${dir:-}")"
+        cmd="$(trim "${cmd:-}")"
+        logfile="$(trim "${logfile:-}")"
+        env_vars="$(trim "${env_vars:-}")"
+        auto_restart="$(trim "${auto_restart:-}")"
 
         # Ignore known header comments
         if [[ "$name" =~ ^(shortname|Format|Format:|Rules:|Rules)$ ]]; then
@@ -1487,11 +1785,9 @@ cmd_check() {
                     warnings+=("Line $line_num: Service '$name' uses 'docker run' without '--name'. scmn will inject '--name $docker_name_hint' and '--label $docker_label_hint'. An explicit '--name' is recommended.")
                 fi
                 # auto_restart is ignored for docker; the engine handles restarts.
-                case "$(echo "$auto_restart" | tr '[:upper:]' '[:lower:]')" in
-                    always|true|1|yes|on-failure|on_failure|failure|fail)
-                        warnings+=("Line $line_num: Service '$name' is Docker-based; scmn ignores auto_restart='$auto_restart'. Use the Docker --restart policy to control restarts.")
-                        ;;
-                esac
+                if [[ -n "$(normalize_restart "$auto_restart")" && "$(normalize_restart "$auto_restart")" != "never" ]]; then
+                    warnings+=("Line $line_num: Service '$name' is Docker-based; scmn ignores auto_restart='$auto_restart'. Use the Docker --restart policy to control restarts.")
+                fi
             fi
         fi
 
@@ -1515,13 +1811,9 @@ cmd_check() {
 
         # Auto-restart policy check
         if [[ -n "$auto_restart" && "$auto_restart" != "-" ]]; then
-            case "$(echo "$auto_restart" | tr '[:upper:]' '[:lower:]')" in
-                always|true|1|yes|on-failure|on_failure|failure|fail|false|no|never|0)
-                    ;;
-                *)
-                    warnings+=("Line $line_num: Unknown auto_restart policy '$auto_restart' for service '$name' (defaults to 'never').")
-                    ;;
-            esac
+            if ! normalize_restart "$auto_restart" >/dev/null 2>&1; then
+                warnings+=("Line $line_num: Unknown auto_restart policy '$auto_restart' for service '$name' (defaults to 'never').")
+            fi
         fi
 
     done < "$CONFIG_FILE"
@@ -1951,6 +2243,7 @@ show_help() {
     echo -e "${BOLD}COMMANDS:${NC}"
     echo "  scmn [start] [shortname]       Starts missing services (or a specific service)"
     echo "  scmn status | ls               Lists all configured services with PID, RAM, Uptime"
+    echo "  scmn status <shortname>        Detailed status for one service (screen + workload proc)"
     echo "  scmn reload                    Syncs running services with config (starts, stops, restarts)"
     echo "  scmn check                     Validates configuration file syntax and paths"
     echo "  scmn enable <shortname> [--now]  Enables service in config (uncomment) & optionally starts"
@@ -2024,7 +2317,15 @@ main() {
             shift || true
             cmd_start "${1:-}"
             ;;
-        status|ls|list)
+        status)
+            shift || true
+            if [[ -n "${1:-}" ]]; then
+                cmd_status_detail "$1"
+            else
+                cmd_status
+            fi
+            ;;
+        ls|list)
             cmd_status
             ;;
         reload)

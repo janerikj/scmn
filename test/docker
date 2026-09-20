@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# Mock `docker` CLI used to test scmn's docker integration without a real
+# daemon. Keeps a tiny fake registry (TSV) and logs every invocation.
+#
+# Registry columns: id <TAB> name <TAB> status <TAB> image <TAB> label <TAB> started_epoch
+# Env: MOCK_DOCKER_STATE (dir, default /tmp/scmn-mock-docker)
+set -euo pipefail
+
+STATE="${MOCK_DOCKER_STATE:-/tmp/scmn-mock-docker}"
+mkdir -p "$STATE"
+REGISTRY="$STATE/containers.tsv"
+LOG="$STATE/calls.log"
+NEXT="$STATE/nextid"
+
+log_call() {
+    printf '%s\n' "$*" >> "$LOG"
+}
+
+gen_id() {
+    local n
+    if [[ -f "$NEXT" ]]; then
+        n=$(cat "$NEXT")
+    else
+        n=0
+    fi
+    printf '%d' "$((n + 1))" > "$NEXT"
+    printf 'a%011d' "$n"
+}
+
+do_ps() {
+    local all=0
+    local fmt=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -a) all=1 ;;
+            --format) shift; fmt="${1:-}" ;;
+            *) : ;;
+        esac
+        shift
+    done
+
+    [[ -f "$REGISTRY" ]] || return 0
+    while IFS=$'\t' read -r id name status image label started; do
+        [[ -n "$id" ]] || continue
+        if [[ $all -eq 0 && "$status" != "running" ]]; then
+            continue
+        fi
+        local line=""
+        [[ "$fmt" == *'{{.Names}}'* ]] && line+="$name"$'\t'
+        [[ "$fmt" == *'{{.ID}}'* ]] && line+="$id"$'\t'
+        [[ "$fmt" == *'{{.Status}}'* ]] && line+="$status"$'\t'
+        if [[ "$fmt" == *'{{.Label "scmn.service"}}'* ]]; then
+            [[ "$label" == "-" ]] && label=""
+            line+="$label"$'\t'
+        fi
+        [[ "$fmt" == *'{{.Image}}'* ]] && line+="$image"$'\t'
+        printf '%s\n' "${line%$'\t'}"
+    done < "$REGISTRY"
+}
+
+do_run() {
+    local detach=0
+    local cname=""
+    local clabel=""
+    local -a rest=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -d|--detach) detach=1 ;;
+            --name) shift; cname="${1:-}" ;;
+            --name=*) cname="${1#--name=}" ;;
+            --label) shift; clabel="${1:-}" ;;
+            --label=*) clabel="${1#--label=}" ;;
+            *) rest+=("$1") ;;
+        esac
+        shift
+    done
+
+    local image="${rest[0]:-mock-image}"
+    local id
+    id=$(gen_id)
+    [[ -n "$cname" ]] || cname="mock_${id: -8}"
+    local labelv="-"
+    if [[ "$clabel" == scmn.service=* ]]; then
+        labelv="${clabel#scmn.service=}"
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$cname" "running" "$image" "$labelv" "$(date +%s)" >> "$REGISTRY"
+    printf '%s\n' "$id"
+
+    if [[ $detach -eq 0 ]]; then
+        # Foreground semantics: stay attached until the container stops so a
+        # screen-session supervisor stays alive, exactly like real `docker run`.
+        while :; do
+            local st
+            st=$(awk -F'\t' -v i="$id" '$1==i {print $3}' "$REGISTRY")
+            [[ "$st" == "running" ]] || break
+            sleep 0.1
+        done
+    fi
+}
+
+do_stop() {
+    local id="${1:-}"
+    awk -F'\t' -v i="$id" 'BEGIN{OFS="\t"} $1==i {$3="stopped"} {print}' "$REGISTRY" > "$REGISTRY.tmp" && mv "$REGISTRY.tmp" "$REGISTRY"
+}
+
+do_rm() {
+    while [[ $# -gt 0 ]] && [[ "$1" == -* ]]; do shift; done
+    local id="${1:-}"
+    grep -v -e "^${id}" "$REGISTRY" > "$REGISTRY.tmp" 2>/dev/null || true
+    mv "$REGISTRY.tmp" "$REGISTRY" 2>/dev/null || true
+}
+
+do_inspect() {
+    local fmt=""
+    local id=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -f|--format) shift; fmt="${1:-}" ;;
+            *) id="${1:-}" ;;
+        esac
+        shift
+    done
+    local started
+    started=$(awk -F'\t' -v i="$id" '$1==i {print $6}' "$REGISTRY")
+    if [[ -z "$started" ]]; then
+        exit 1
+    fi
+    if [[ "$fmt" == *StartedAt* ]]; then
+        date -u -d "@$started" '+%Y-%m-%dT%H:%M:%S.%NZ'
+    elif [[ "$fmt" == *"State.Pid"* ]]; then
+        echo "${MOCK_DOCKER_PID:-0}"
+    else
+        echo "0"
+    fi
+}
+
+do_stats() {
+    local id=""
+    while [[ $# -gt 0 ]]; do
+        [[ "$1" == -* ]] && shift && continue
+        id="${1:-}"
+        shift
+    done
+    if grep -q "^${id}" "$REGISTRY" 2>/dev/null; then
+        printf '12.5MiB / 2GiB\n'
+    fi
+}
+
+cmd="${1:-}"
+shift || true
+log_call "$cmd $*"
+
+case "$cmd" in
+    ps) do_ps "$@" ;;
+    run) do_run "$@" ;;
+    stop) do_stop "${1:-}" "${2:-}" ;;
+    rm) do_rm "$@" ;;
+    inspect) do_inspect "$@" ;;
+    stats) do_stats "$@" ;;
+    version) printf 'Docker version 24.0.0, build mock\n' ;;
+    *) exit 1 ;;
+esac
