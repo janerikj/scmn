@@ -1,4 +1,4 @@
-# scmn (v0.12.3)
+# scmn (v0.12.4)
 
 > A lightweight, zero-daemon Linux service manager built on top of GNU Screen.
 
@@ -164,10 +164,26 @@ By default, log files are truncated when they exceed **50 MB** (keeping the last
 MAX_LOG_SIZE_MB=100 scmn
 ```
 
-### 5. Console Status Bar & Scrollback Buffer
+### 5. Python Applications in a Virtualenv
+`scmn` runs an arbitrary shell command in a screen session, so a virtualenv works out of the box — point the command at the venv's own binary instead of activating it (the `directory` column is used as the working directory, and the `env` column can export `VIRTUAL_ENV` for apps that read it):
+
+```text
+# Recommended: call the venv binary directly (no activation needed)
+myapp | /home/jej/myapp | .venv/bin/python main.py | /tmp/myapp.log | VIRTUAL_ENV=/home/jej/myapp/.venv | always
+# Or for a venv-installed entry point / console script
+api   | /home/jej/api  | .venv/bin/uvicorn app:app --host 0.0.0.0 --port 8000 | /tmp/api.log | - | always
+```
+
+Activation inside the command also works (restart loops run in a shell, so `source` + `&&` is fine):
+
+```text
+myapp | /home/jej/myapp | source .venv/bin/activate && python main.py | /tmp/myapp.log | - | on-failure
+```
+
+### 6. Console Status Bar & Scrollback Buffer
 When attaching to a service (`scmn attach <shortname>`), `scmn` displays a status bar at the bottom of the screen with the service name, detach shortcut (`Ctrl+A D`), hostname, and time. Sessions automatically run in **UTF-8 mode (`-U`)** with **1000 lines of scrollback buffer in RAM** (customizable via `SCMN_SCROLLBACK=5000`). To enable scrollback and copy mode: press `Ctrl+A Esc`.
 
-### 6. Docker-based Services (`docker run`)
+### 7. Docker-based Services (`docker run`)
 `docker run` does **not** run your application as a child of the `docker run` client — the container executes under the Docker daemon (`dockerd`). Killing the screen session only kills the client, so the container would keep running. `scmn` therefore treats docker services specially:
 
 - On **start**, `scmn` automatically injects a tracking label `--label scmn.service=<shortname>` and, when the command lacks an explicit `--name`, a deterministic `--name scmn_<shortname>` (lowercased). Label-based tracking means containers are findable even if they end up with random names (e.g. leftovers started before docker support existed).

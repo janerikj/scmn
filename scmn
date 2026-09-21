@@ -9,7 +9,7 @@
 set -euo pipefail
 
 # Application version
-VERSION="v0.12.3"
+VERSION="v0.12.4"
 
 # Ensure user-local binaries (e.g. tools installed under ~/.local/bin) are on
 # PATH. Cron and systemd run with a minimal PATH (/usr/bin:/bin) and would
