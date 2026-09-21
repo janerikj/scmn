@@ -1,4 +1,4 @@
-# scmn (v0.12.1)
+# scmn (v0.12.2)
 
 > A lightweight, zero-daemon Linux service manager built on top of GNU Screen.
 
@@ -174,6 +174,7 @@ When attaching to a service (`scmn attach <shortname>`), `scmn` displays a statu
 - On **stop / restart / reload**, `scmn` also stops and removes the containers belonging to the service (`docker stop`, then `docker rm -f`), matched by label or name.
 - If the screen session is gone but a container still runs, `scmn status` shows the service as **`ORPHANED`** with the container ID as its PID (instead of `STOPPED`).
 - **Self-healing supervision**: for *foreground* containers (no `-d`), `scmn start`/`scmn reload`/cron and `scmn attach` automatically re-create the supervising screen session with `docker attach` when the container still runs but its session was lost (e.g. after a `docker.service` restart) — so status returns to `RUNNING` and attach keeps working. Detached (`docker run -d`) services intentionally stay unsupervised.
+- **Detach vs. stop while attached**: normal supervision runs the attached `docker run` client. `Ctrl+A D` detaches without touching the container; `Ctrl+C` forwards SIGINT to the container's main process (Docker's default signal proxy) and therefore **stops the service** (status `STOPPED`) — restart it with `scmn start <shortname>`. In a restored `docker attach --sig-proxy=false` session, `Ctrl+C` only kills the supervising client, leaving the container running (`RESTORABLE`).
 - Docker services are **never wrapped in a restart loop** (running `docker run` again while the container lives would collide on `--name` and fail forever). Use the Docker **`--restart`** policy in the command to control restarts — e.g. `docker run --restart unless-stopped --name mybot myimage:latest`.
 - `scmn status` for a running docker service reports the **container's** memory and uptime (via `docker stats`/`docker inspect`), not the `docker run` client's.
 
