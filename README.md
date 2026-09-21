@@ -1,4 +1,4 @@
-# scmn (v0.12.0)
+# scmn (v0.12.1)
 
 > A lightweight, zero-daemon Linux service manager built on top of GNU Screen.
 
@@ -93,6 +93,8 @@ ping_bot | - | ping -i 2 1.1.1.1 | none | - | false
 | `scmn version` (or `-V`, `--version`) | Displays version information |
 | `scmn help` (or `-h`, `--help`) | Displays help message |
 
+> **Cron watchdog & PATH:** the memo `scmn cron install` creates run every 15 minutes as a bare `cron` job, whose environment has a minimal PATH (`/usr/bin:/bin`). `scmn` therefore prepends `~/.local/bin` and `~/bin` to `PATH` at startup, so services using tools installed outside the system dirs start correctly. If a service command cannot be resolved at start, `scmn` prints a clear `Command not found` error instead of silently cycling in `RESTARTING`.
+
 ---
 
 ## Configuration File Reference
@@ -181,10 +183,13 @@ Recommended docker service definition (loops and restart policies are handled by
 mybot | /app | docker run --restart unless-stopped --name mybot myimage:latest | /var/log/mybot.log | - | no
 ```
 
-**`scmn docker orphans [--clean]`** lists running containers that `scmn` does not supervise:
-- **MANAGED** — container has a live screen session (healthy).
-- **ORPHANED** — container carries a `scmn.service` label / `scmn_` name but its screen session is gone; `--clean` stops and removes these automatically.
+**`scmn docker orphans [--clean]`** lists running containers and how they relate to the configured docker services:
+- **MANAGED** — container of a *currently configured* service with a live screen session (healthy).
+- **RESTORABLE** — container of a *currently configured* service whose screen session is gone (e.g. the `docker run` client exited when the engine restarted the container). The engine keeps the container running and `scmn start`/`scmn attach` re-attach supervision. **`--clean` never removes these.**
+- **ORPHANED** — container of a service **no longer in the config** (renamed/removed), carrying a `scmn.service` label or `scmn_` name; `--clean` stops and removes these automatically.
 - **UNTRACKED** — no scmn label/name at all; these are probably unrelated containers and are never touched without an interactive per-container confirmation.
+
+Containers owned by currently configured services are therefore always safe from `--clean`, even if an engine restart has temporarily detached their screen session.
 
 > These notes apply to plain `docker run` / `docker container run`. Compose-style stacks (`docker compose up`) are not tracked per-service; stop the stack with `docker compose down`.
 

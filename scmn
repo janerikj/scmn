@@ -9,7 +9,18 @@
 set -euo pipefail
 
 # Application version
-VERSION="v0.12.0"
+VERSION="v0.12.1"
+
+# Ensure user-local binaries (e.g. tools installed under ~/.local/bin) are on
+# PATH. Cron and systemd run with a minimal PATH (/usr/bin:/bin) and would
+# otherwise fail to run service commands installed outside the system dirs.
+for __scmn_p in "$HOME/.local/bin" "$HOME/bin"; do
+    case ":$PATH:" in
+        *":$__scmn_p:"*) ;;
+        *) export PATH="$__scmn_p:$PATH" ;;
+    esac
+done
+unset __scmn_p
 
 # Ensure SCREENDIR is set and safe (prevents permission issues on some Linux setups)
 if [[ -z "${SCREENDIR:-}" ]]; then
@@ -578,6 +589,20 @@ get_service_state() {
     echo "RUNNING"
 }
 
+# Return 0 if the first token of a service command is resolvable (a real binary
+# on PATH) or must not be pre-resolved (shell keyword/builtin/pattern/var/path).
+cmd_token_resolvable() {
+    local line="$1" tok
+    read -r tok _ <<<"$line"
+    [[ -n "$tok" ]] || return 0
+    case "$tok" in
+        *\$*|*/*|*=*|'('|'{'|'[') return 0 ;;
+        :|case|cd|do|done|elif|else|esac|eval|exec|export|fi|for|function|if|in|select|set|source|then|time|until|while)
+            return 0 ;;
+    esac
+    command -v "$tok" >/dev/null 2>&1
+}
+
 # Start a specific service from config definition
 start_service() {
     local name="$1"
@@ -643,6 +668,16 @@ start_service() {
             docker rm -f "$old_id" >/dev/null 2>&1 || true
         done < <(docker_matched_ids "$cmd" "$name" all)
         docker_query_invalidate
+    fi
+
+    # Fail fast with a clear message when the service binary cannot be found on
+    # PATH (e.g. cron runs scmn with PATH=/usr/bin:/bin), instead of silently
+    # cycling the restart loop in RESTARTING state forever.
+    if ! cmd_is_docker "$cmd" && ! cmd_token_resolvable "$cmd"; then
+        local start_tok
+        read -r start_tok _ <<<"$cmd"
+        log_error "Command not found on PATH: '$start_tok' (service '$name'). Check the command or fix PATH before starting."
+        return 1
     fi
 
     # Build screen command (-U for UTF-8 mode, -h for scrollback buffer)
@@ -971,7 +1006,7 @@ cmd_start() {
                     log_warn "Service '$target' is disabled in configuration. Use 'scmn enable $target --now' to enable and start it."
                     return 0
                 fi
-                start_service "$name" "$dir" "$cmd" "$logfile" "$env_vars" "$auto_restart"
+                start_service "$name" "$dir" "$cmd" "$logfile" "$env_vars" "$auto_restart" || true
                 truncate_log_if_needed "$name" "$logfile"
             fi
         }
@@ -1621,7 +1656,7 @@ cmd_restart() {
                 fi
                 cmd_stop "$target"
                 sleep 0.5
-                start_service "$name" "$dir" "$cmd" "$logfile" "$env_vars" "$auto_restart"
+                start_service "$name" "$dir" "$cmd" "$logfile" "$env_vars" "$auto_restart" || true
             fi
         }
         parse_config restart_callback "true"
@@ -1702,7 +1737,7 @@ cmd_reload() {
                     log_info "Configuration changed for '$name'. Restarting..."
                     stop_service_by_name "$name"
                     sleep 0.3
-                    start_service "$name" "${service_dir[$name]}" "${service_cmd[$name]}" "${service_log[$name]}" "${service_env[$name]}" "${service_restart[$name]}"
+                    start_service "$name" "${service_dir[$name]}" "${service_cmd[$name]}" "${service_log[$name]}" "${service_env[$name]}" "${service_restart[$name]}" || true
                     restarted_count=$((restarted_count + 1))
                 fi
             fi
@@ -1715,7 +1750,7 @@ cmd_reload() {
         state_of=$(get_service_state "$name" "${service_cmd[$name]:-}")
         if [[ "$state_of" == "STOPPED" || -z "$state_of" ]]; then
             log_info "Starting missing service '$name'..."
-            start_service "$name" "${service_dir[$name]}" "${service_cmd[$name]}" "${service_log[$name]}" "${service_env[$name]}" "${service_restart[$name]}"
+            start_service "$name" "${service_dir[$name]}" "${service_cmd[$name]}" "${service_log[$name]}" "${service_env[$name]}" "${service_restart[$name]}" || true
             started_count=$((started_count + 1))
         elif [[ "$state_of" == "RUNNING" || "$state_of" == "ORPHANED" ]]; then
             log_info "Service '$name' is already running (state: $state_of)."
@@ -2201,7 +2236,7 @@ cmd_docker_orphans() {
 
     local -a orphan_ids=()
     local -a untracked=()
-    local orphan_count=0 untracked_count=0 managed_count=0
+    local orphan_count=0 untracked_count=0 managed_count=0 engine_count=0
 
     local rows
     rows=$(docker ps --format '{{.Names}}\t{{.ID}}\t{{.Label "scmn.service"}}\t{{.Image}}' 2>/dev/null)
@@ -2223,34 +2258,37 @@ cmd_docker_orphans() {
         image=$(cut -d$'\t' -f4 <<<"$row")
         [[ -n "$cid" ]] || continue
 
+        # A container owned by a currently configured service is never an
+        # orphan, even if its supervising screen session is gone (e.g. the
+        # docker run client exited when the engine restarted the container).
+        # The engine keeps the container running; start/attach re-attach
+        # supervision. Only containers of services no longer in the config
+        # (or with no scmn origin at all) may be cleaned.
+        local owner=""
         if [[ -n "$label" ]]; then
-            local owner
             owner="${label_owner[$label]:-}"
-            if [[ -n "$owner" ]] && is_running "$owner"; then
+        fi
+        if [[ -z "$owner" && -n "$cname" ]]; then
+            owner="${name_owner[$cname]:-}"
+        fi
+        if [[ -n "$owner" ]]; then
+            if is_running "$owner"; then
                 managed_count=$((managed_count + 1))
                 printf "%-20s %b %-9s %-24s %s\n" "${cname:0:20}" "${CYAN}MANAGED${NC}   " "${cid:0:9}" "${image:0:24}" "service '$owner'"
-                continue
+            else
+                engine_count=$((engine_count + 1))
+                printf "%-20s %b %-9s %-24s %s\n" "${cname:0:20}" "${BLUE}RESTORABLE${NC}" "${cid:0:9}" "${image:0:24}" "service '$owner' (no session, engine-managed)"
             fi
-            # Label present but no live session -> orphaned
-            orphan_count=$((orphan_count + 1))
-            orphan_ids+=("$cid")
-            printf "%-20s %b %-9s %-24s %s\n" "${cname:0:20}" "${YELLOW}ORPHANED${NC}  " "${cid:0:9}" "${image:0:24}" "label ${label}"
         elif [[ "$cname" == scmn_* ]]; then
-            # scmn-created container (convention) without a live session
+            # scmn-created container (convention) of a service no longer configured
             orphan_count=$((orphan_count + 1))
             orphan_ids+=("$cid")
             printf "%-20s %b %-9s %-24s %s\n" "${cname:0:20}" "${YELLOW}ORPHANED${NC}  " "${cid:0:9}" "${image:0:24}" "scmn-named, no session"
-        elif [[ -n "${name_owner[$cname]:-}" ]]; then
-            local owner2
-            owner2="${name_owner[$cname]}"
-            if is_running "$owner2"; then
-                managed_count=$((managed_count + 1))
-                printf "%-20s %b %-9s %-24s %s\n" "${cname:0:20}" "${CYAN}MANAGED${NC}   " "${cid:0:9}" "${image:0:24}" "service '$owner2'"
-            else
-                orphan_count=$((orphan_count + 1))
-                orphan_ids+=("$cid")
-                printf "%-20s %b %-9s %-24s %s\n" "${cname:0:20}" "${YELLOW}ORPHANED${NC}  " "${cid:0:9}" "${image:0:24}" "service '$owner2'"
-            fi
+        elif [[ -n "$label" ]]; then
+            # Label present but no configured owner -> orphaned
+            orphan_count=$((orphan_count + 1))
+            orphan_ids+=("$cid")
+            printf "%-20s %b %-9s %-24s %s\n" "${cname:0:20}" "${YELLOW}ORPHANED${NC}  " "${cid:0:9}" "${image:0:24}" "label ${label}"
         else
             untracked_count=$((untracked_count + 1))
             untracked+=("$cid|$cname")
@@ -2260,7 +2298,7 @@ cmd_docker_orphans() {
     done < <(printf "%s\n" "$rows")
 
     echo "--------------------------------------------------------------------------------"
-    log_info "Summary: ${CYAN}${managed_count}${NC} managed, ${YELLOW}${orphan_count}${NC} orphaned, ${GRAY}${untracked_count}${NC} untracked."
+    log_info "Summary: ${CYAN}${managed_count}${NC} managed, ${BLUE}${engine_count}${NC} restorable, ${YELLOW}${orphan_count}${NC} orphaned, ${GRAY}${untracked_count}${NC} untracked."
 
     if (( orphan_count == 0 && untracked_count == 0 )); then
         log_info "Nothing to clean."

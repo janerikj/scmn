@@ -145,6 +145,43 @@ assert_match "$out" "Status: +STOPPED"
 assert_match "$(grep 'Screen session:' <<<"$out")" "not running"
 assert_match "$(grep 'Workload proc:' <<<"$out")" "not running"
 
+echo "== K: start works from a cron-like minimal env (no ~/.local/bin in PATH) =="
+CRON_HOME="$TMP/cronhome"
+CRON_SCREEN="$TMP/.screen-cron"
+CRON_STATE="$TMP/.state-cron"
+CRON_LOG="$TMP/scmn-cron.log"
+mkdir -p "$CRON_HOME" "$CRON_HOME/.local/bin" "$CRON_SCREEN" "$CRON_STATE"
+chmod 700 "$CRON_SCREEN"
+cat > "$CRON_HOME/.local/bin/bitbang" <<'EOF'
+#!/usr/bin/env bash
+exec tail -f /dev/null
+EOF
+chmod +x "$CRON_HOME/.local/bin/bitbang"
+cat > "$TMP/cron.conf" <<EOF
+bbstub | - | bitbang serve shell | none | - | never
+EOF
+
+run_cron_scmn() {
+    env -i HOME="$CRON_HOME" SCREENDIR="$CRON_SCREEN" SCMN_STATE_DIR="$CRON_STATE" \
+        SCMN_LOG="$CRON_LOG" PATH="/usr/bin:/bin" \
+        "$SCMN" -c "$TMP/cron.conf" "$@"
+}
+
+run_cron_scmn start bbstub >/dev/null 2>&1
+sleep 0.6
+kout=$(run_cron_scmn status bbstub 2>&1)
+assert_match "$kout" "Status: +RUNNING"
+assert_match "$(SCREENDIR="$CRON_SCREEN" screen -ls 2>/dev/null)" "\.bbstub\b"
+
+echo "== K2: missing binary -> clear error, no RESTARTING loop =="
+cat > "$TMP/cron.conf" <<EOF
+nosuchbin | - | nosuchbinary_xyz | none | - | always
+EOF
+k2out=$(run_cron_scmn start nosuchbin 2>&1 || true)
+assert_match "$k2out" "Command not found on PATH: 'nosuchbinary_xyz'"
+assert_eq "$(SCREENDIR="$CRON_SCREEN" screen -ls 2>/dev/null | grep -c '\.nosuchbin\b' || true)" "0" "screen session created for missing binary"
+assert_match "$(run_cron_scmn status nosuchbin 2>&1)" "Status: +STOPPED"
+
 echo
 echo "PASSED: $PASSES, FAILED: $FAILURES"
 [[ $FAILURES -eq 0 ]]

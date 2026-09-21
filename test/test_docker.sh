@@ -123,17 +123,23 @@ assert_eq "$(docker ps -a --format '{{.Names}}' | grep -x spinx || true)" "" "sp
 sout=$(run_scmn status 2>&1)
 assert_match "$(grep '^spin' <<<"$sout")" "STOPPED"
 
-echo "== F: orphans scan (ORPHANED + UNTRACKED) =="
+echo "== F: orphans scan (RESTORABLE configured + ORPHANED unconfigured + UNTRACKED) =="
 docker run -d --name unrelated img-x:1 >/dev/null 2>&1
+docker run -d --name oldc --label scmn.service=oldname img-old:1 >/dev/null 2>&1
+docker run -d --name scmn_gone img-g:1 >/dev/null 2>&1
 oout=$(run_scmn docker orphans 2>&1)
 assert_match "$(grep -i untracked <<<"$oout")" "UNTRACKED"
-assert_match "$(grep -i 'detr ' <<<"$oout")" "ORPHANED"
+assert_match "$(grep -i 'detr ' <<<"$oout")" "RESTORABLE"
+assert_match "$(grep -i 'oldc ' <<<"$oout")" "ORPHANED"
+assert_match "$(grep -i 'scmn_gone ' <<<"$oout")" "ORPHANED"
 
-echo "== G: orphans --clean (untracked is safe) =="
+echo "== G: orphans --clean (configured containers survive; only unconfigured removed) =="
 gout=$(printf 'n\n' | run_scmn docker orphans --clean 2>&1)
-assert_eq "$(docker ps -a --format '{{.Names}}' | grep -x detr || true)" "" "orphan detr not cleaned"
-assert_eq "$(docker ps -a --format '{{.Names}}' | grep -x unrelated || true)" "unrelated" "untracked container was removed"
+assert_eq "$(docker ps -a --format '{{.Names}}' | grep -x detr || true)" "detr" "configured detached container was removed"
 assert_eq "$(docker ps -a --format '{{.Names}}' | grep -x fg || true)" "fg" "managed container was removed"
+assert_eq "$(docker ps -a --format '{{.Names}}' | grep -x oldc || true)" "" "unconfigured (renamed) container not cleaned"
+assert_eq "$(docker ps -a --format '{{.Names}}' | grep -x scmn_gone || true)" "" "scmn-named unconfigured container not cleaned"
+assert_eq "$(docker ps -a --format '{{.Names}}' | grep -x unrelated || true)" "unrelated" "untracked container was removed"
 
 echo
 echo "PASSED: $PASSES, FAILED: $FAILURES"
