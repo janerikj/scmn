@@ -9,7 +9,7 @@
 set -euo pipefail
 
 # Application version
-VERSION="v0.12.2"
+VERSION="v0.12.3"
 
 # Ensure user-local binaries (e.g. tools installed under ~/.local/bin) are on
 # PATH. Cron and systemd run with a minimal PATH (/usr/bin:/bin) and would
@@ -2231,13 +2231,20 @@ cmd_docker_orphans() {
 
     echo
     log_info "Scanning running Docker containers..."
-    echo "--------------------------------------------------------------------------------"
-    printf "${BOLD}%-20s %-10s %-9s %-24s %s${NC}\n" "NAME" "STATUS" "CONTAINER" "IMAGE" "NOTE"
-    printf "%s\n" "--------------------------------------------------------------------------------"
 
     local -a orphan_ids=()
     local -a untracked=()
     local orphan_count=0 untracked_count=0 managed_count=0 engine_count=0
+
+    print_container_block() {
+        local cname="$1" status_str="$2" cid="$3" image="$4" note_str="$5"
+        printf "%s\n" "--------------------------------------------------------------------------------"
+        printf "%-12s : %s\n" "NAME" "$cname"
+        printf "%-12s : %b\n" "STATUS" "$status_str"
+        printf "%-12s : %s\n" "CONTAINER" "$cid"
+        printf "%-12s : %s\n" "IMAGE" "$image"
+        printf "%-12s : %s\n" "NOTE" "$note_str"
+    }
 
     local rows
     rows=$(docker ps --format '{{.Names}}\t{{.ID}}\t{{.Label "scmn.service"}}\t{{.Image}}' 2>/dev/null)
@@ -2275,31 +2282,30 @@ cmd_docker_orphans() {
         if [[ -n "$owner" ]]; then
             if is_running "$owner"; then
                 managed_count=$((managed_count + 1))
-                printf "%-20s %b %-9s %-24s %s\n" "${cname:0:20}" "${CYAN}MANAGED${NC}   " "${cid:0:9}" "${image:0:24}" "service '$owner'"
+                print_container_block "$cname" "${CYAN}MANAGED${NC}" "$cid" "${image:--}" "service '$owner'"
             else
                 engine_count=$((engine_count + 1))
-                printf "%-20s %b %-9s %-24s %s\n" "${cname:0:20}" "${BLUE}RESTORABLE${NC}" "${cid:0:9}" "${image:0:24}" "service '$owner' (no session, engine-managed)"
+                print_container_block "$cname" "${YELLOW}ORPHANED${NC} (${BLUE}RESTORABLE${NC})" "$cid" "${image:--}" "service '$owner' (no session, engine-managed)"
             fi
         elif [[ "$cname" == scmn_* ]]; then
             # scmn-created container (convention) of a service no longer configured
             orphan_count=$((orphan_count + 1))
             orphan_ids+=("$cid")
-            printf "%-20s %b %-9s %-24s %s\n" "${cname:0:20}" "${YELLOW}ORPHANED${NC}  " "${cid:0:9}" "${image:0:24}" "scmn-named, no session"
+            print_container_block "$cname" "${YELLOW}ORPHANED${NC}" "$cid" "${image:--}" "scmn-named, no session"
         elif [[ -n "$label" ]]; then
             # Label present but no configured owner -> orphaned
             orphan_count=$((orphan_count + 1))
             orphan_ids+=("$cid")
-            printf "%-20s %b %-9s %-24s %s\n" "${cname:0:20}" "${YELLOW}ORPHANED${NC}  " "${cid:0:9}" "${image:0:24}" "label ${label}"
+            print_container_block "$cname" "${YELLOW}ORPHANED${NC}" "$cid" "${image:--}" "label ${label}"
         else
             untracked_count=$((untracked_count + 1))
             untracked+=("$cid|$cname")
-            local inote="${image:-unknown image}"
-            printf "%-20s %b %-9s %-24s %s\n" "${cname:0:20}" "${GRAY}UNTRACKED${NC} " "${cid:0:9}" "${inote:0:24}" "no scmn label"
+            print_container_block "$cname" "${GRAY}UNTRACKED${NC}" "$cid" "${image:--}" "no scmn label"
         fi
     done < <(printf "%s\n" "$rows")
 
     echo "--------------------------------------------------------------------------------"
-    log_info "Summary: ${CYAN}${managed_count}${NC} managed, ${BLUE}${engine_count}${NC} restorable, ${YELLOW}${orphan_count}${NC} orphaned, ${GRAY}${untracked_count}${NC} untracked."
+    log_info "Summary: ${CYAN}${managed_count}${NC} managed, ${YELLOW}${engine_count}${NC} orphaned (restorable), ${YELLOW}${orphan_count}${NC} orphaned (cleanable), ${GRAY}${untracked_count}${NC} untracked."
 
     if (( orphan_count == 0 && untracked_count == 0 )); then
         log_info "Nothing to clean."

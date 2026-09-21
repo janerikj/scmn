@@ -44,6 +44,13 @@ assert_not_match() {
     if grep -qE "$2" <<<"$1"; then fail "unexpected pattern '$2' in: $(head -c 400 <<<"$1")"; else pass; fi
 }
 
+# Extract the vertical block for one container from `scmn docker orphans` output
+# (records are separated by the dash lines printed between blocks).
+block_of() {
+    local name="$1"
+    awk -v RS='----' -v n="$name" '$0 ~ "NAME[[:space:]]*: " n "\n" { print $0 }'
+}
+
 run_scmn() {
     "$SCMN" -c "$TMP/scmn.conf" "$@"
 }
@@ -123,15 +130,18 @@ assert_eq "$(docker ps -a --format '{{.Names}}' | grep -x spinx || true)" "" "sp
 sout=$(run_scmn status 2>&1)
 assert_match "$(grep '^spin' <<<"$sout")" "STOPPED"
 
-echo "== F: orphans scan (RESTORABLE configured + ORPHANED unconfigured + UNTRACKED) =="
+echo "== F: orphans scan (vertical blocks: MANAGED / ORPHANED (RESTORABLE) / ORPHANED / UNTRACKED) =="
 docker run -d --name unrelated img-x:1 >/dev/null 2>&1
 docker run -d --name oldc --label scmn.service=oldname img-old:1 >/dev/null 2>&1
 docker run -d --name scmn_gone img-g:1 >/dev/null 2>&1
 oout=$(run_scmn docker orphans 2>&1)
-assert_match "$(grep -i untracked <<<"$oout")" "UNTRACKED"
-assert_match "$(grep -i 'detr ' <<<"$oout")" "RESTORABLE"
-assert_match "$(grep -i 'oldc ' <<<"$oout")" "ORPHANED"
-assert_match "$(grep -i 'scmn_gone ' <<<"$oout")" "ORPHANED"
+assert_match "$(block_of fg <<<"$oout")" "STATUS.*MANAGED"
+assert_match "$(block_of detr <<<"$oout")" "STATUS.*ORPHANED.*RESTORABLE"
+assert_match "$(block_of oldc <<<"$oout")" "STATUS.*ORPHANED"
+assert_not_match "$(block_of oldc <<<"$oout")" "RESTORABLE"
+assert_match "$(block_of scmn_gone <<<"$oout")" "STATUS.*ORPHANED"
+assert_not_match "$(block_of scmn_gone <<<"$oout")" "RESTORABLE"
+assert_match "$(block_of unrelated <<<"$oout")" "STATUS.*UNTRACKED"
 
 echo "== G: orphans --clean (configured containers survive; only unconfigured removed) =="
 gout=$(printf 'n\n' | run_scmn docker orphans --clean 2>&1)

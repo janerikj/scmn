@@ -1,4 +1,4 @@
-# scmn (v0.12.2)
+# scmn (v0.12.3)
 
 > A lightweight, zero-daemon Linux service manager built on top of GNU Screen.
 
@@ -184,9 +184,9 @@ Recommended docker service definition (loops and restart policies are handled by
 mybot | /app | docker run --restart unless-stopped --name mybot myimage:latest | /var/log/mybot.log | - | no
 ```
 
-**`scmn docker orphans [--clean]`** lists running containers and how they relate to the configured docker services:
+**`scmn docker orphans [--clean]`** lists running containers in one block per container (NAME/STATUS/CONTAINER/IMAGE/NOTE), with these statuses:
 - **MANAGED** — container of a *currently configured* service with a live screen session (healthy).
-- **RESTORABLE** — container of a *currently configured* service whose screen session is gone (e.g. the `docker run` client exited when the engine restarted the container). The engine keeps the container running and `scmn start`/`scmn attach` re-attach supervision. **`--clean` never removes these.**
+- **ORPHANED (RESTORABLE)** — container of a *currently configured* service whose screen session is gone (e.g. the `docker run` client exited when the engine restarted the container). The engine keeps the container running and `scmn start`/`scmn attach` re-attach supervision. **`--clean` never removes these.**
 - **ORPHANED** — container of a service **no longer in the config** (renamed/removed), carrying a `scmn.service` label or `scmn_` name; `--clean` stops and removes these automatically.
 - **UNTRACKED** — no scmn label/name at all; these are probably unrelated containers and are never touched without an interactive per-container confirmation.
 
