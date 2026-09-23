@@ -9,7 +9,7 @@
 set -euo pipefail
 
 # Application version
-VERSION="v0.12.5"
+VERSION="v1.0.0"
 
 # Ensure user-local binaries (e.g. tools installed under ~/.local/bin) are on
 # PATH. Cron and systemd run with a minimal PATH (/usr/bin:/bin) and would
@@ -117,23 +117,30 @@ ensure_config() {
 # The snapshot is lazily loaded on first use and refreshed after every screen
 # mutation.
 declare -A SCREEN_SNAPSHOT=()
+declare -A SCREEN_ATTACH=()
 SCREEN_SNAPSHOT_LOADED=0
 
 screen_snapshot_parse() {
-    local line pid name
+    local line pid name attach
     while IFS= read -r line || [[ -n "$line" ]]; do
         # screen -ls line: "<pid>.<session_name>\t(Detached)"
         line="${line#"${line%%[![:space:]]*}"}"
         if [[ "$line" =~ ^[0-9]+\. ]]; then
             pid="${line%%.*}"
             name="${line#*.}"
+            attach="Detached"
+            if [[ "$line" =~ \(Attached\) ]]; then
+                attach="Attached"
+            fi
             SCREEN_SNAPSHOT["${name%%[[:space:]]*}"]="$pid"
+            SCREEN_ATTACH["${name%%[[:space:]]*}"]="$attach"
         fi
     done
 }
 
 screen_snapshot_load() {
     SCREEN_SNAPSHOT=()
+    SCREEN_ATTACH=()
     screen_snapshot_parse < <(screen -ls 2>/dev/null || true)
     SCREEN_SNAPSHOT_LOADED=1
 }
@@ -150,6 +157,15 @@ is_running() {
         screen_snapshot_load
     fi
     [[ -n "${SCREEN_SNAPSHOT[$name]:-}" ]]
+}
+
+# Attach state ('Attached' / 'Detached') of a screen session, from the snapshot.
+screen_attach_state() {
+    local name="$1"
+    if [[ $SCREEN_SNAPSHOT_LOADED -eq 0 ]]; then
+        screen_snapshot_load
+    fi
+    echo "${SCREEN_ATTACH[$name]:-Detached}"
 }
 
 # Helper: Get PID of a screen session by shortname
@@ -1546,7 +1562,17 @@ cmd_toggle() {
 
 # Command: Attach to screen session
 cmd_attach() {
-    local target="${1:-}"
+    local force=false
+    local target=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --force|-f) force=true ;;
+            -*) log_error "Unknown option: $1"; exit 1 ;;
+            *) target="$1" ;;
+        esac
+        shift || true
+    done
+
     if [[ -z "$target" ]]; then
         log_error "Please specify the service shortname to attach to!"
         log_info "Example: scmn attach webserver"
@@ -1554,6 +1580,18 @@ cmd_attach() {
     fi
 
     if is_running "$target"; then
+        # A session can be stuck in '(Attached)' with no live client behind it
+        # (e.g. a dropped SSH connection). Plain `screen -r` then just prints
+        # "There is no screen to be resumed" — so guard and require --force.
+        if [[ "$(screen_attach_state "$target")" == "Attached" ]]; then
+            if $force; then
+                log_info "Session '$target' was attached elsewhere; taking over control."
+                exec screen -d -r "$target"
+            fi
+            log_error "Session for '$target' is attached elsewhere."
+            log_info "Run 'scmn attach --force $target' to detach the other end and take over, or detach from it with Ctrl+A D."
+            exit 1
+        fi
         log_info "Attaching to '$target'. Detach with Ctrl+A D - Ctrl+C sends SIGINT to the service (stops it)."
         exec screen -r "$target"
     fi
@@ -2473,7 +2511,7 @@ main() {
             ;;
         attach|a)
             shift
-            cmd_attach "${1:-}" "$cmd"
+            cmd_attach "$@"
             ;;
         send)
             shift

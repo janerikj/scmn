@@ -228,6 +228,35 @@ run_scmn start envy4 >/dev/null 2>&1
 sleep 0.6
 assert_match "$(cat "$SCMN_LOG")" "chmod 600.*envapp/\.env"
 
+echo "== ATTACH: attached session is guarded; --force takes over =="
+cat > "$CONF" <<EOF
+aattsvc | - | sleep 120 | none | - | always
+EOF
+run_scmn start aattsvc >/dev/null 2>&1
+sleep 0.6
+assert_match "$(run_scmn status aattsvc 2>&1)" "Status: +RUNNING"
+
+if command -v script >/dev/null 2>&1; then
+    script -qec "SCREENDIR=\"$SCREENDIR\" screen -r aattsvc" /dev/null >/dev/null 2>&1 &
+    ATTCH_PID=$!
+    ATTTOUT=""
+    for _ in 1 2 3 4 5; do
+        sleep 0.4
+        ATTTOUT=$(SCREENDIR="$SCREENDIR" screen -ls aattsvc 2>/dev/null)
+        [[ "$ATTTOUT" == *"(Attached)"* ]] && break
+    done
+    assert_match "$ATTTOUT" "\(Attached\)"
+    aout=$(run_scmn attach aattsvc 2>&1; echo "rc=$?")
+    assert_match "$aout" "attached elsewhere"
+    assert_match "$aout" "rc=1"
+    fout=$(run_scmn attach --force aattsvc 2>&1; echo "rc=$?")
+    assert_match "$fout" "taking over control"
+    assert_match "$fout" "rc=1"
+    kill "$ATTCH_PID" 2>/dev/null || true
+else
+    echo "SKIP: script(1) not available; attached-state attach not tested"
+fi
+
 echo
 echo "PASSED: $PASSES, FAILED: $FAILURES"
 [[ $FAILURES -eq 0 ]]

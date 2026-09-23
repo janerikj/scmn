@@ -1,4 +1,4 @@
-# scmn (v0.12.5)
+# scmn (v1.0.0)
 
 > A lightweight, zero-daemon Linux service manager built on top of GNU Screen.
 
@@ -156,6 +156,7 @@ Without `NOPASSWD`, service will hang waiting. Use `attach` to access the consol
 ### 3. Detaching from a Screen Session
 When connected to a service via `scmn attach <shortname>`:
 - Press **`Ctrl + A`**, then press **`D`** to detach cleanly without stopping the service.
+- If the service session is already attached elsewhere (e.g. a dropped SSH connection left it stuck as "attached"), `scmn attach <shortname>` refuses with an explanation — use `scmn attach --force <shortname>` to detach the other end and take over.
 
 ### 4. Custom Log Size Limits
 By default, log files are truncated when they exceed **50 MB** (keeping the last 25 MB). You can override this limit via the `MAX_LOG_SIZE_MB` environment variable:
