@@ -1,4 +1,4 @@
-# scmn (v0.12.4)
+# scmn (v0.12.5)
 
 > A lightweight, zero-daemon Linux service manager built on top of GNU Screen.
 
@@ -180,10 +180,18 @@ Activation inside the command also works (restart loops run in a shell, so `sour
 myapp | /home/jej/myapp | source .venv/bin/activate && python main.py | /tmp/myapp.log | - | on-failure
 ```
 
-### 6. Console Status Bar & Scrollback Buffer
+### 6. Environment Variables from a `.env` File
+Keep passwords and API keys out of `scmn.conf`, where they also leak into `.state` and the logs. Instead, put them in a `.env` file in the service's working directory: `scmn` loads it into the service's shell before the command runs, and the command references the variables (e.g. `${DB_PASSWORD}`) so status and logs show names, not secrets.
+
+- Syntax: `KEY=value` or `export KEY=…`, `#` comments, quote values containing spaces.
+- Exported **inside the screen session only** — never into scmn's own process, `.state`, or the event log.
+- The `env` column (5th) is exported after and overrides `.env` values.
+- `scmn` warns if `.env` is group/other-readable; `chmod 600` silences it.
+
+### 7. Console Status Bar & Scrollback Buffer
 When attaching to a service (`scmn attach <shortname>`), `scmn` displays a status bar at the bottom of the screen with the service name, detach shortcut (`Ctrl+A D`), hostname, and time. Sessions automatically run in **UTF-8 mode (`-U`)** with **1000 lines of scrollback buffer in RAM** (customizable via `SCMN_SCROLLBACK=5000`). To enable scrollback and copy mode: press `Ctrl+A Esc`.
 
-### 7. Docker-based Services (`docker run`)
+### 8. Docker-based Services (`docker run`)
 `docker run` does **not** run your application as a child of the `docker run` client — the container executes under the Docker daemon (`dockerd`). Killing the screen session only kills the client, so the container would keep running. `scmn` therefore treats docker services specially:
 
 - On **start**, `scmn` automatically injects a tracking label `--label scmn.service=<shortname>` and, when the command lacks an explicit `--name`, a deterministic `--name scmn_<shortname>` (lowercased). Label-based tracking means containers are findable even if they end up with random names (e.g. leftovers started before docker support existed).

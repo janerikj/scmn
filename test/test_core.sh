@@ -182,6 +182,52 @@ assert_match "$k2out" "Command not found on PATH: 'nosuchbinary_xyz'"
 assert_eq "$(SCREENDIR="$CRON_SCREEN" screen -ls 2>/dev/null | grep -c '\.nosuchbin\b' || true)" "0" "screen session created for missing binary"
 assert_match "$(run_cron_scmn status nosuchbin 2>&1)" "Status: +STOPPED"
 
+echo "== ENV1: <dir>/.env is loaded into the session shell (comments/export/quotes) =="
+ENVDIR="$TMP/envapp"
+mkdir -p "$ENVDIR"
+cat > "$ENVDIR/.env" <<'EOF'
+# a comment
+export EXPORTED=yes
+QUOTED="a b"
+EOF
+chmod 600 "$ENVDIR/.env"
+cat > "$CONF" <<EOF
+envy | $ENVDIR | sh -c 'echo "\${EXPORTED}-\${QUOTED}" > envout' | none | - | on-failure
+EOF
+run_scmn start envy >/dev/null 2>&1
+sleep 0.6
+assert_eq "$(cat "$ENVDIR/envout")" "yes-a b" "dotenv vars not loaded"
+assert_not_match "$(cat "$SCMN_LOG")" "chmod 600" "no perm warning for a 0600 .env"
+
+echo "== ENV2: env column overrides <dir>/.env =="
+cat > "$ENVDIR/.env" <<'EOF'
+FOO=fromenv
+EOF
+cat > "$CONF" <<EOF
+envy2 | $ENVDIR | sh -c 'echo "\${FOO}" > envout2' | none | FOO=fromcol | on-failure
+EOF
+run_scmn start envy2 >/dev/null 2>&1
+sleep 0.6
+assert_eq "$(cat "$ENVDIR/envout2")" "fromcol" "env column should override .env"
+
+echo "== ENV3: missing .env still starts cleanly =="
+mkdir -p "$TMP/emptydir3"
+cat > "$CONF" <<EOF
+envy3 | $TMP/emptydir3 | sh -c 'echo "\${FOO:-none}" > envout3' | none | - | on-failure
+EOF
+run_scmn start envy3 >/dev/null 2>&1
+sleep 0.6
+assert_eq "$(cat "$TMP/emptydir3/envout3")" "none" "missing .env should not break start"
+
+echo "== ENV4: group/other-readable .env causes a chmod warning =="
+chmod 0644 "$ENVDIR/.env"
+cat > "$CONF" <<EOF
+envy4 | $ENVDIR | sleep 120 | none | - | always
+EOF
+run_scmn start envy4 >/dev/null 2>&1
+sleep 0.6
+assert_match "$(cat "$SCMN_LOG")" "chmod 600.*envapp/\.env"
+
 echo
 echo "PASSED: $PASSES, FAILED: $FAILURES"
 [[ $FAILURES -eq 0 ]]

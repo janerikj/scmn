@@ -9,7 +9,7 @@
 set -euo pipefail
 
 # Application version
-VERSION="v0.12.4"
+VERSION="v0.12.5"
 
 # Ensure user-local binaries (e.g. tools installed under ~/.local/bin) are on
 # PATH. Cron and systemd run with a minimal PATH (/usr/bin:/bin) and would
@@ -694,11 +694,24 @@ start_service() {
         screen_args+=(-L -Logfile "$logfile")
     fi
 
+    # Load <dir>/.env into the screen session's shell so secrets live in a 0600
+    # dotenv file instead of scmn.conf, .state, or the logs. Env vars from the
+    # env column below are exported AFTER the load and therefore take precedence.
+    local dotenv_prefix=""
+    if [[ -n "$dir" && "$dir" != "-" && -f "$dir/.env" ]]; then
+        local dotenv="$dir/.env"
+        if [[ -n "$(find "$dotenv" -maxdepth 0 -perm /066 2>/dev/null)" ]]; then
+            log_warn "Secret file '$dotenv' is group/other-readable. Run: chmod 600 '$dotenv'"
+            log_event "WARN" "Secret file '$dotenv' is group/other-readable. Run: chmod 600 '$dotenv'"
+        fi
+        dotenv_prefix="set -a; . \"$dotenv\"; set +a; "
+    fi
+
     # Prepare execution wrapper with env vars and auto-restart loop if enabled
-    local exec_cmd=""
+    local exec_cmd="$dotenv_prefix"
 
     if [[ -n "$env_vars" && "$env_vars" != "none" && "$env_vars" != "-" ]]; then
-        exec_cmd="export $env_vars; "
+        exec_cmd="${exec_cmd}export $env_vars; "
     fi
 
     local restart_mode
