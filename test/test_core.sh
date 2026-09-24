@@ -257,6 +257,41 @@ else
     echo "SKIP: script(1) not available; attached-state attach not tested"
 fi
 
+echo "== WATCHDOG: start detaches a stuck (Attached) session without restarting it =="
+cat > "$CONF" <<EOF
+wdogsvc | - | sleep 120 | none | - | always
+EOF
+run_scmn start wdogsvc >/dev/null 2>&1
+sleep 0.6
+wpid_before=$(grep '^wdogsvc ' <<<"$(run_scmn status 2>&1)" | awk '{print $3}')
+wsess_before=$(SCREENDIR="$SCREENDIR" screen -ls 2>/dev/null | grep -oE '[0-9]+\.wdogsvc\b' | head -n 1)
+assert_not_match "$wpid_before" "^$" "wdogsvc should be running"
+
+if command -v script >/dev/null 2>&1; then
+    script -qec "SCREENDIR=\"$SCREENDIR\" screen -r wdogsvc" /dev/null >/dev/null 2>&1 &
+    WATT_PID=$!
+    WOUT=""
+    for _ in 1 2 3 4 5; do
+        sleep 0.4
+        WOUT=$(SCREENDIR="$SCREENDIR" screen -ls wdogsvc 2>/dev/null)
+        [[ "$WOUT" == *"(Attached)"* ]] && break
+    done
+    assert_match "$WOUT" "\(Attached\)"
+    # the watchdog path in `start` must detach the stuck session, keep it
+    # RUNNING, and NOT re-create it (same screen session pid)
+    run_scmn start wdogsvc >/dev/null 2>&1
+    sleep 0.6
+    WOUT2=$(SCREENDIR="$SCREENDIR" screen -ls wdogsvc 2>/dev/null)
+    assert_match "$WOUT2" "\(Detached\)"
+    wsess_after=$(SCREENDIR="$SCREENDIR" screen -ls 2>/dev/null | grep -oE '[0-9]+\.wdogsvc\b' | head -n 1)
+    assert_eq "$wsess_after" "$wsess_before" "stuck (Attached) session should be detached, not replaced"
+    assert_match "$(grep '^wdogsvc ' <<<"$(run_scmn status 2>&1)")" "RUNNING"
+    kill "$WATT_PID" 2>/dev/null || true
+else
+    echo "SKIP: script(1) not available; watchdog detach not tested"
+fi
+run_scmn stop wdogsvc >/dev/null 2>&1
+
 echo
 echo "PASSED: $PASSES, FAILED: $FAILURES"
 [[ $FAILURES -eq 0 ]]

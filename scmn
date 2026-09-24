@@ -9,7 +9,7 @@
 set -euo pipefail
 
 # Application version
-VERSION="v1.0.0"
+VERSION="v1.0.1"
 
 # Ensure user-local binaries (e.g. tools installed under ~/.local/bin) are on
 # PATH. Cron and systemd run with a minimal PATH (/usr/bin:/bin) and would
@@ -600,9 +600,22 @@ get_service_state() {
                 return 0
             fi
         fi
+
+        echo "RUNNING"
+        return 0
     fi
 
-    echo "RUNNING"
+    # The session is listed in `screen -ls` but has no live child process at
+    # all: a stale/dead husk (e.g. after a lost/(Attached) session whose
+    # workload exited). Report DEAD so the start/reload/cron watchdog replaces
+    # it instead of treating it as RUNNING forever.
+    if cmd_is_docker "$cmd" && docker_any_container_running "$cmd" "$name"; then
+        echo "RUNNING"
+        return 0
+    fi
+
+    echo "DEAD"
+    return 0
 }
 
 # Return 0 if the first token of a service command is resolvable (a real binary
@@ -629,8 +642,40 @@ start_service() {
     local auto_restart="${6:-false}"
 
     if is_running "$name"; then
-        log_info "Service '$name' is already running."
-        return 0
+        # Watchdog self-healing: a session listed by `screen -ls` can be stuck
+        # in '(Attached)' after a dropped/suspended terminal, or be a dead husk
+        # whose workload has exited. Both mislead cron/start into thinking the
+        # service is healthy while it may have stopped doing work. Detach stuck
+        # sessions; replace dead ones with a fresh instance.
+        if [[ "$(screen_attach_state "$name")" == "Attached" ]]; then
+            log_info "Session '$name' is attached elsewhere (likely a lost terminal); detaching."
+            screen -S "$name" -X detach 2>/dev/null || true
+            sleep 0.2
+            screen_snapshot_refresh
+        fi
+
+        local current_state
+        current_state=$(get_service_state "$name" "$cmd")
+        if [[ "$current_state" == "RUNNING" || "$current_state" == "RESTARTING" || "$current_state" == "ORPHANED" ]]; then
+            log_info "Service '$name' is already running."
+            return 0
+        fi
+
+        # Listed but not healthy (DEAD / STOPPED): tear the stale session down
+        # and fall through to start a fresh one.
+        log_warn "Service '$name' has a stale session (state: $current_state); replacing it."
+        log_event "WARN" "Replacing stale session for '$name' (state: $current_state)"
+        screen -S "$name" -X quit 2>/dev/null || true
+        sleep 0.3
+        screen_snapshot_refresh
+        if is_running "$name"; then
+            local stale_pid
+            stale_pid=$(get_session_pid "$name")
+            kill -9 "$stale_pid" 2>/dev/null || true
+            screen -wipe 2>/dev/null || true
+            sleep 0.2
+            screen_snapshot_refresh
+        fi
     fi
 
     # Trim fields
@@ -1192,6 +1237,10 @@ cmd_status() {
                 if [[ -n "$main_pid" ]]; then
                     pid_str="$main_pid"
                 fi
+            elif [[ "$state" == "DEAD" ]]; then
+                # Visible width: 10 chars ("DEAD" + 6 spaces)
+                status_colored="${RED}DEAD${NC}      "
+                pid_str=$(get_session_pid "$name")
             elif [[ "$state" == "ORPHANED" ]]; then
                 # Visible width: 10 chars ("ORPHANED" + 2 spaces)
                 status_colored="${YELLOW}ORPHANED${NC}  "
@@ -1782,7 +1831,15 @@ cmd_reload() {
                     old_sig=$(cat "$state_file" 2>/dev/null || true)
                 fi
 
-                if [[ -n "$old_sig" && "$old_sig" == "$current_sig" ]]; then
+                if [[ "$(get_service_state "$name" "${service_cmd[$name]:-}")" == "DEAD" ]]; then
+                    # Listed session whose workload is gone (e.g. lost attach):
+                    # effectively down despite looking running, so restart it.
+                    log_info "Stale session for '$name' found; restarting..."
+                    stop_service_by_name "$name"
+                    sleep 0.3
+                    start_service "$name" "${service_dir[$name]}" "${service_cmd[$name]}" "${service_log[$name]}" "${service_env[$name]}" "${service_restart[$name]}" || true
+                    restarted_count=$((restarted_count + 1))
+                elif [[ -n "$old_sig" && "$old_sig" == "$current_sig" ]]; then
                     log_info "Service '$name' is up-to-date and running."
                     unchanged_count=$((unchanged_count + 1))
                 else
@@ -1800,7 +1857,7 @@ cmd_reload() {
     for name in "${!configured_enabled[@]}"; do
         local state_of
         state_of=$(get_service_state "$name" "${service_cmd[$name]:-}")
-        if [[ "$state_of" == "STOPPED" || -z "$state_of" ]]; then
+        if [[ "$state_of" == "STOPPED" || -z "$state_of" || "$state_of" == "DEAD" ]]; then
             log_info "Starting missing service '$name'..."
             start_service "$name" "${service_dir[$name]}" "${service_cmd[$name]}" "${service_log[$name]}" "${service_env[$name]}" "${service_restart[$name]}" || true
             started_count=$((started_count + 1))
