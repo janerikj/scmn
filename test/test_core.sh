@@ -38,6 +38,9 @@ assert_match() {
 assert_not_match() {
     if grep -qE "$2" <<<"$1"; then fail "unexpected pattern '$2' in: $(head -c 400 <<<"$1")"; else pass; fi
 }
+assert_not_eq() {
+    if [[ "$1" != "$2" ]]; then pass; else fail "'$1' unexpectedly equals '$2' ($3)"; fi
+}
 
 run_scmn() {
     "$SCMN" -c "$CONF" "$@"
@@ -257,15 +260,14 @@ else
     echo "SKIP: script(1) not available; attached-state attach not tested"
 fi
 
-echo "== WATCHDOG: start detaches a stuck (Attached) session without restarting it =="
+echo "== WATCHDOG: start leaves an (Attached) but running session alone =="
 cat > "$CONF" <<EOF
 wdogsvc | - | sleep 120 | none | - | always
 EOF
 run_scmn start wdogsvc >/dev/null 2>&1
 sleep 0.6
-wpid_before=$(grep '^wdogsvc ' <<<"$(run_scmn status 2>&1)" | awk '{print $3}')
 wsess_before=$(SCREENDIR="$SCREENDIR" screen -ls 2>/dev/null | grep -oE '[0-9]+\.wdogsvc\b' | head -n 1)
-assert_not_match "$wpid_before" "^$" "wdogsvc should be running"
+assert_not_match "$wsess_before" "^$" "wdogsvc should have a session"
 
 if command -v script >/dev/null 2>&1; then
     script -qec "SCREENDIR=\"$SCREENDIR\" screen -r wdogsvc" /dev/null >/dev/null 2>&1 &
@@ -277,20 +279,44 @@ if command -v script >/dev/null 2>&1; then
         [[ "$WOUT" == *"(Attached)"* ]] && break
     done
     assert_match "$WOUT" "\(Attached\)"
-    # the watchdog path in `start` must detach the stuck session, keep it
-    # RUNNING, and NOT re-create it (same screen session pid)
+    # cron/watchdog (`start`) must NOT kick an attached-but-running session:
+    # the same session must persist, still (Attached) and still RUNNING
     run_scmn start wdogsvc >/dev/null 2>&1
     sleep 0.6
     WOUT2=$(SCREENDIR="$SCREENDIR" screen -ls wdogsvc 2>/dev/null)
-    assert_match "$WOUT2" "\(Detached\)"
+    assert_match "$WOUT2" "\(Attached\)"
     wsess_after=$(SCREENDIR="$SCREENDIR" screen -ls 2>/dev/null | grep -oE '[0-9]+\.wdogsvc\b' | head -n 1)
-    assert_eq "$wsess_after" "$wsess_before" "stuck (Attached) session should be detached, not replaced"
+    assert_eq "$wsess_after" "$wsess_before" "attached running session must not be detached or replaced"
     assert_match "$(grep '^wdogsvc ' <<<"$(run_scmn status 2>&1)")" "RUNNING"
     kill "$WATT_PID" 2>/dev/null || true
 else
-    echo "SKIP: script(1) not available; watchdog detach not tested"
+    echo "SKIP: script(1) not available; attached-state watchdog not tested"
 fi
 run_scmn stop wdogsvc >/dev/null 2>&1
+
+echo "== DEAD: start replaces a listed-but-dead (zombie) session =="
+cat > "$CONF" <<EOF
+deadsvc | - | sleep 60 | none | - | always
+EOF
+# Build a husk whose workload has already exited but which stays listed via
+# screen 'zombie' mode; scmn must detect it as DEAD and replace it.
+SCREENDIR="$SCREENDIR" screen -U -dmS deadsvc bash -c 'sleep 0.4'
+sleep 0.2
+SCREENDIR="$SCREENDIR" screen -S deadsvc -X zombie kr 2>/dev/null || true
+dsess_before=""
+for _ in 1 2 3 4 5; do
+    sleep 0.4
+    dsess_before=$(SCREENDIR="$SCREENDIR" screen -ls 2>/dev/null | grep -oE '[0-9]+\.deadsvc\b' | head -n 1)
+    [[ -n "$dsess_before" ]] && break
+done
+assert_not_match "$dsess_before" "^$" "deadsvc zombie session should stay listed"
+assert_match "$(run_scmn status deadsvc 2>&1)" "Status: +DEAD"
+run_scmn start deadsvc >/dev/null 2>&1
+sleep 0.6
+dsess_after=$(SCREENDIR="$SCREENDIR" screen -ls 2>/dev/null | grep -oE '[0-9]+\.deadsvc\b' | head -n 1)
+assert_not_eq "$dsess_after" "$dsess_before" "DEAD husk should be replaced with a new session"
+assert_match "$(run_scmn status deadsvc 2>&1)" "Status: +RUNNING"
+run_scmn stop deadsvc >/dev/null 2>&1
 
 echo
 echo "PASSED: $PASSES, FAILED: $FAILURES"

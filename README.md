@@ -1,4 +1,4 @@
-# scmn (v1.0.1)
+# scmn (v1.0.2)
 
 > A lightweight, zero-daemon Linux service manager built on top of GNU Screen.
 
@@ -157,7 +157,7 @@ Without `NOPASSWD`, service will hang waiting. Use `attach` to access the consol
 When connected to a service via `scmn attach <shortname>`:
 - Press **`Ctrl + A`**, then press **`D`** to detach cleanly without stopping the service.
 - If the service session is already attached elsewhere (e.g. a dropped SSH connection left it stuck as "attached"), `scmn attach <shortname>` refuses with an explanation — use `scmn attach --force <shortname>` to detach the other end and take over.
-- **Self-healing**: the watchdog (`scmn start` / cron) and `scmn reload` automatically normalize stale sessions — a session stuck `(Attached)` by a lost or suspended terminal is detached, and a session that is still *listed* but whose workload has exited (status **`DEAD`**) is replaced with a fresh instance. This prevents a silently dead session from being mistaken for a healthy, running one. `scmn status` shows **`DEAD`** for such sessions so the problem is visible instead of hidden behind `RUNNING`.
+- **Self-healing**: the watchdog (`scmn start` / cron) detects a session that is still *listed* but whose workload has exited (status **`DEAD`**) and replaces it with a fresh instance. Sessions that merely show `(Attached)` — even with a dropped/suspended terminal — are never disturbed, so an actively attached user is never kicked out by cron; take over a truly stuck session manually with `scmn attach --force <shortname>`. `scmn status` shows **`DEAD`** for husk sessions so the problem is visible instead of hidden behind `RUNNING`.
 
 ### 4. Custom Log Size Limits
 By default, log files are truncated when they exceed **50 MB** (keeping the last 25 MB). You can override this limit via the `MAX_LOG_SIZE_MB` environment variable:
