@@ -1499,8 +1499,8 @@ stop_service_by_name() {
         done
 
         # Step 3: tear down the screen session itself (closes the pty)
-        screen -X -S "$name" quit 2>/dev/null || true
-        screen -wipe 2>/dev/null || true
+        screen -X -S "$name" quit >/dev/null 2>&1 || true
+        screen -wipe >/dev/null 2>&1 || true
 
         # Step 4: force-kill any stragglers that ignored SIGTERM
         local stragglers=0
