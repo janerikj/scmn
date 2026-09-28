@@ -318,6 +318,30 @@ assert_not_eq "$dsess_after" "$dsess_before" "DEAD husk should be replaced with 
 assert_match "$(run_scmn status deadsvc 2>&1)" "Status: +RUNNING"
 run_scmn stop deadsvc >/dev/null 2>&1
 
+cat > "$TMP/hup_sim.py" <<'EOF'
+import signal, time
+signal.signal(signal.SIGHUP, signal.SIG_IGN)
+print("hup-sim up", flush=True)
+time.sleep(3600)
+EOF
+
+echo "== STOP-SIGHUP: stop must kill a workload that ignores SIGHUP (mosquitto-like) =="
+cat > "$CONF" <<EOF
+hupsvc | - | python3 "$TMP/hup_sim.py" | none | - | never
+EOF
+run_scmn start hupsvc >/dev/null 2>&1
+sleep 0.8
+hp=$(pgrep -f "hup_sim.py" | head -n 1)
+assert_not_match "$hp" "^$" "hup_sim workload should be running"
+run_scmn stop hupsvc >/dev/null 2>&1
+sleep 0.4
+assert_match "$(cat "$SCMN_LOG")" "Stopped service 'hupsvc'"
+if kill -0 "$hp" 2>/dev/null; then
+    fail "workload (pid $hp) survived scmn stop"
+else
+    pass
+fi
+
 echo
 echo "PASSED: $PASSES, FAILED: $FAILURES"
 [[ $FAILURES -eq 0 ]]

@@ -1,4 +1,4 @@
-# scmn (v1.0.2)
+# scmn (v1.0.3)
 
 > A lightweight, zero-daemon Linux service manager built on top of GNU Screen.
 
@@ -11,6 +11,7 @@
 - **Zero-Daemon Architecture**: Consumes **0 MB RAM** at idle. Only executes when invoked directly or periodically via cron.
 - **Docker Integration**: Services launched via `docker run` are tracked by a `scmn.service` label (injected automatically) plus a deterministic `--name`. `stop`/`restart`/`reload` also stops and removes the underlying containers — no orphaned containers left behind when the screen session dies.
 - **Interactive Attach/Detach**: Seamlessly jump into any service's console using native GNU Screen (`Ctrl+A`, then `D` to detach).
+- **Reliable Stop**: `stop`/`restart`/`reload` terminate the service's real process tree with `SIGTERM`→`SIGKILL` escalation, scoped to the service's wrapper session. Workloads that ignore the terminal-hangup signal of a closed pty (e.g. daemonizing apps such as mosquitto) are stopped too — not just the Screen session torn down.
 - **Smart Config Sync (`reload`)**: Hot-reloads configuration—starts missing services, restarts changed services, and stops disabled/removed services without unnecessary restarts.
 - **Config Validation (`check`)**: Validates syntax, duplicate names, paths, executables, and restart policies before deployment.
 - **Service Enable & Disable**: Enable or disable services directly from the CLI (`scmn enable`, `scmn disable`) with optional immediate action (`--now`).

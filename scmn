@@ -9,7 +9,7 @@
 set -euo pipefail
 
 # Application version
-VERSION="v1.0.2"
+VERSION="v1.0.3"
 
 # Ensure user-local binaries (e.g. tools installed under ~/.local/bin) are on
 # PATH. Cron and systemd run with a minimal PATH (/usr/bin:/bin) and would
@@ -1408,6 +1408,42 @@ cmd_status_detail() {
 
 # Stop a single service with graceful SIGTERM, SIGKILL fallback, and
 # Docker container cleanup (docker containers survive screen termination).
+# Recursively collect all descendant PIDs of a root pid (excluding the root).
+# Used by stop/reload to reach every process a service has spawned — not just
+# the direct bash wrapper.
+descendant_pids_of() {
+    local root="$1"
+    local -a frontier=("$root")
+    local -a out=()
+    local p next
+    while (( ${#frontier[@]} > 0 )); do
+        local -a batch=("${frontier[@]}")
+        frontier=()
+        for p in "${batch[@]}"; do
+            while IFS= read -r next; do
+                [[ -n "$next" && "$next" != "$root" ]] || continue
+                out+=("$next")
+                frontier+=("$next")
+            done < <(pgrep -P "$p" 2>/dev/null || true)
+        done
+    done
+    printf '%s\n' "${out[@]}"
+}
+
+# List every process belonging to a single scmn service: members of the wrapper
+# shell's session (catches workloads that detached from the pty and were
+# reparented, e.g. daemonizing apps) plus all descendants of the screen session.
+# Never includes the screen server pid itself.
+service_scope_pids() {
+    local screen_pid="$1"
+    local sid="$2"
+    local p
+    {
+        [[ -n "$sid" ]] && pgrep -s "$sid" 2>/dev/null || true
+        descendant_pids_of "$screen_pid"
+    } | sort -u
+}
+
 stop_service_by_name() {
     local name="$1"
     local cmd="${2:-}"
@@ -1429,32 +1465,62 @@ stop_service_by_name() {
     pid=$(get_session_pid "$name")
 
     if [[ -n "$pid" ]]; then
-        # Step 1: Send graceful shutdown signal via screen quit (SIGTERM)
-        screen -X -S "$name" quit 2>/dev/null || true
+        # Session scope of the wrapper shell. Everything this service spawned
+        # keeps this SID — including workloads that detached from the pty during
+        # startup (apps that survive `screen -X quit`, which only closes the pty
+        # and delivers SIGHUP; mosquitto treats SIGHUP as a config reload).
+        local wrapper sid
+        wrapper=$(pgrep -P "$pid" 2>/dev/null | head -n 1 || true)
+        sid=""
+        if [[ -n "$wrapper" ]]; then
+            sid=$(ps -o sid= -p "$wrapper" 2>/dev/null | tr -d ' ' || true)
+        fi
 
-        # Step 2: Wait up to 2 seconds (10 steps of 0.2s) for clean termination
+        # Step 1: SIGTERM the wrapper first so the (auto-)restart loop cannot
+        # respawn the workload, then SIGTERM every remaining session member.
+        [[ -n "$wrapper" ]] && kill -TERM "$wrapper" 2>/dev/null || true
+        sleep 0.2
+
+        local p
+        while IFS= read -r p; do
+            [[ -n "$p" && "$p" != "$pid" ]] && kill -TERM "$p" 2>/dev/null || true
+        done < <(service_scope_pids "$pid" "$sid")
+
+        # Step 2: Wait up to 2 seconds for graceful termination (10 x 0.2s)
         local waited=0
-        local max_wait=10
-        while is_running "$name" && (( waited < max_wait )); do
+        while (( waited < 10 )); do
+            local alive=0
+            while IFS= read -r p; do
+                [[ -n "$p" && "$p" != "$pid" ]] && alive=$((alive + 1))
+            done < <(service_scope_pids "$pid" "$sid")
+            (( alive == 0 )) && break
             sleep 0.2
-            screen_snapshot_refresh
             waited=$((waited + 1))
         done
 
-        # Step 3: Check if still running; if so, force kill (SIGKILL)
-        if is_running "$name"; then
-            log_warn "Service '$name' did not stop gracefully within 2s. Force killing (SIGKILL)..."
-            log_event "WARN" "Service '$name' did not stop gracefully within 2s. Force killing (SIGKILL)."
-            # Kill child processes inside screen session first, then screen itself
-            pkill -9 -P "$pid" 2>/dev/null || true
-            kill -9 "$pid" 2>/dev/null || true
-            screen -wipe 2>/dev/null || true
+        # Step 3: tear down the screen session itself (closes the pty)
+        screen -X -S "$name" quit 2>/dev/null || true
+        screen -wipe 2>/dev/null || true
+
+        # Step 4: force-kill any stragglers that ignored SIGTERM
+        local stragglers=0
+        while IFS= read -r p; do
+            [[ -n "$p" && "$p" != "$pid" ]] || continue
+            if kill -0 "$p" 2>/dev/null; then
+                kill -KILL "$p" 2>/dev/null || true
+                stragglers=$((stragglers + 1))
+            fi
+        done < <(service_scope_pids "$pid" "$sid")
+        if (( stragglers > 0 )); then
+            log_warn "Service '$name' did not stop gracefully; SIGKILL sent to $stragglers process(es)."
+            log_event "WARN" "Service '$name' did not stop gracefully; SIGKILL sent to $stragglers process(es)."
             sleep 0.2
-            screen_snapshot_refresh
         fi
+
+        screen_snapshot_refresh
     fi
 
-    # Step 4: Stop/remove Docker containers launched by this service. `docker
+    # Step 5: Stop/remove Docker containers launched by this service. `docker
     # run` executes the container under dockerd, not under the screen session's
     # process tree, so it keeps running even when the screen session is gone.
     if $is_docker; then
@@ -1470,12 +1536,26 @@ stop_service_by_name() {
         docker_stopped=false
     fi
 
-    if $screen_stopped && $docker_stopped; then
+    # Leftover workload processes (after screen teardown their descendants are
+    # gone, but session members with their own session would remain reachable).
+    local leftover=""
+    if [[ -n "$pid" ]]; then
+        while IFS= read -r p; do
+            [[ -n "$p" && "$p" != "$pid" ]] || continue
+            if kill -0 "$p" 2>/dev/null; then
+                leftover="$leftover $p"
+            fi
+        done < <({ pgrep -s "${sid:-nonexistent}" 2>/dev/null || true; } | sort -u)
+    fi
+
+    if $screen_stopped && $docker_stopped && [[ -z "$leftover" ]]; then
         state_remove "$name"
         log_success "Stopped service '$name'."
         log_event "OK" "Stopped service '$name'."
     else
-        log_error "Failed to stop service '$name' (screen running: $screen_stopped, docker running: $docker_stopped)."
+        local reason="screen running: $screen_stopped, docker running: $docker_stopped"
+        [[ -n "$leftover" ]] && reason="$reason, leftover pids:$leftover"
+        log_error "Failed to stop service '$name' ($reason)."
         log_event "ERROR" "Failed to stop service '$name' even with SIGKILL."
     fi
 }
