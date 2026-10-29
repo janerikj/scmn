@@ -1,4 +1,4 @@
-# scmn (v1.0.3)
+# scmn ![Version](https://img.shields.io/badge/version-v1.0.3-yellow)
 
 > A lightweight, zero-daemon Linux service manager built on top of GNU Screen.
 
